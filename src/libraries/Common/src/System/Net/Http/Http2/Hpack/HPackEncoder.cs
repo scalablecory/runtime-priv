@@ -73,7 +73,7 @@ namespace System.Net.Http.HPack
                 case 400:
                 case 404:
                 case 500:
-                    buffer[0] = (byte)(0x80 | StaticTable.StatusIndex[statusCode]);
+                    buffer[0] = (byte)(0x80 | H2StaticTable.StatusIndex[statusCode]);
                     return 1;
                 default:
                     // Send as Literal Header Field Without Indexing - Indexed Name
@@ -501,6 +501,23 @@ namespace System.Net.Http.HPack
             bool success = EncodeLiteralHeaderFieldWithoutIndexingNewName(name, span, out int length);
             Debug.Assert(success, $"Stack-allocated space was too small for \"{name}\".");
             return span.Slice(0, length).ToArray();
+        }
+
+        /// <summary>
+        /// Encodes a "Literal Header Field without Indexing - New Name" to a new array.
+        /// </summary>
+        public static byte[] EncodeLiteralHeaderFieldWithoutIndexingNewNameToAllocatedArray(string name, string value)
+        {
+            int initialStorageNeeded = 1 + IntegerEncoder.MaxInt32EncodedLength + name.Length + IntegerEncoder.MaxInt32EncodedLength + value.Length;
+            Span<byte> span = initialStorageNeeded <= 256 ? stackalloc byte[initialStorageNeeded] : new byte[initialStorageNeeded];
+
+            bool success = EncodeLiteralHeaderFieldWithoutIndexingNewName(name, span, out int nameLength);
+            Debug.Assert(success, $"Initial space allocated for \"{name}: {value}\" was too small.");
+
+            success = EncodeStringLiteral(name, span.Slice(nameLength), out int valueLength);
+            Debug.Assert(success, $"Initial space allocated for \"{name}: {value}\" was too small.");
+
+            return span.Slice(0, nameLength + valueLength).ToArray();
         }
 
         /// <summary>Encodes a "Literal Header Field without Indexing" to a new array.</summary>
