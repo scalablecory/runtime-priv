@@ -503,6 +503,23 @@ namespace System.Net.Http.HPack
             return span.Slice(0, length).ToArray();
         }
 
+        /// <summary>
+        /// Encodes a "Literal Header Field without Indexing - New Name" to a new array.
+        /// </summary>
+        public static byte[] EncodeLiteralHeaderFieldWithoutIndexingNewNameToAllocatedArray(string name, string value)
+        {
+            int initialStorageNeeded = 1 + IntegerEncoder.MaxInt32EncodedLength + name.Length + IntegerEncoder.MaxInt32EncodedLength + value.Length;
+            Span<byte> span = initialStorageNeeded <= 256 ? stackalloc byte[initialStorageNeeded] : new byte[initialStorageNeeded];
+
+            bool success = EncodeLiteralHeaderFieldWithoutIndexingNewName(name, span, out int nameLength);
+            Debug.Assert(success, $"Initial space allocated for \"{name}: {value}\" was too small.");
+
+            success = EncodeStringLiteral(name, span.Slice(nameLength), out int valueLength);
+            Debug.Assert(success, $"Initial space allocated for \"{name}: {value}\" was too small.");
+
+            return span.Slice(0, nameLength + valueLength).ToArray();
+        }
+
         /// <summary>Encodes a "Literal Header Field without Indexing" to a new array.</summary>
         public static byte[] EncodeLiteralHeaderFieldWithoutIndexingToAllocatedArray(int index, string value)
         {

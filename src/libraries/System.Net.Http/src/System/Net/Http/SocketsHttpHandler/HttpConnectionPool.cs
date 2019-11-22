@@ -4,6 +4,7 @@
 
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Net.Http.Headers;
 using System.Net.Http.HPack;
@@ -25,10 +26,34 @@ namespace System.Net.Http
 
         private readonly HttpConnectionPoolManager _poolManager;
         private readonly HttpConnectionKind _kind;
-        private readonly string _host;
-        private readonly int _port;
         private readonly Uri _proxyUri;
         internal readonly byte[] _encodedAuthorityHostHeader;
+
+        /// <summary>The origin authority used to construct the <see cref="HttpConnectionPool"/>.</summary>
+        private readonly HttpAuthority _originAuthority;
+
+        /// <summary>Initially set identical to <see cref="_originAuthority"/> (i.e. what came in the request URL), this can be updated based on Alt-Svc.</summary>
+        private volatile HttpAuthority _http3Authority;
+
+        /// <summary>A timer to expire <see cref="_http3Authority"/> and return the pool to <see cref="_originAuthority"/>. Initialized on first use.</summary>
+        private Timer _authorityExpireTimer;
+
+        /// <summary>
+        /// When an Alt-Svc authority fails due to 421 Misdirected Request, it is placed in the blacklist to be ignored
+        /// for <see cref="AltSvcBlacklistTimeoutInMilliseconds"/> milliseconds. Initialized on first use.
+        /// </summary>
+        private volatile HashSet<HttpAuthority> _altSvcBlacklist;
+        private CancellationTokenSource _altSvcBlacklistTimerCancellation;
+        private volatile bool _altSvcEnabled = true;
+
+        /// <summary>
+        /// If <see cref="_altSvcBlacklist"/> exceeds this size, Alt-Svc will be disabled entirely for <see cref="AltSvcBlacklistTimeoutInMilliseconds"/> milliseconds.
+        /// This is to prevent a failing server from bloating the dictionary beyond a reasonable value.
+        /// </summary>
+        private const int MaxAltSvcIgnoreListSize = 8;
+
+        /// <summary>The time, in milliseconds, that an authority should remain in <see cref="_altSvcBlacklist"/>.</summary>
+        private const int AltSvcBlacklistTimeoutInMilliseconds = 10 * 60 * 1000;
 
         /// <summary>List of idle connections stored in the pool.</summary>
         private readonly List<CachedConnection> _idleConnections = new List<CachedConnection>();
@@ -38,6 +63,7 @@ namespace System.Net.Http
         private bool _http2Enabled;
         private Http2Connection _http2Connection;
         private SemaphoreSlim _http2ConnectionCreateLock;
+        private byte[] _http2AltSvcOriginUri;
 
         /// <summary>For non-proxy connection pools, this is the host name in bytes; for proxies, null.</summary>
         private readonly byte[] _hostHeaderValueBytes;
@@ -64,10 +90,14 @@ namespace System.Net.Http
         {
             _poolManager = poolManager;
             _kind = kind;
-            _host = host;
-            _port = port;
             _proxyUri = proxyUri;
             _maxConnections = maxConnections;
+
+            if (host != null)
+            {
+                _originAuthority = new HttpAuthority(host, port);
+                _http3Authority = _originAuthority;
+            }
 
             _http2Enabled = (_poolManager.Settings._maxHttpVersion == HttpVersion.Version20);
 
@@ -128,14 +158,14 @@ namespace System.Net.Http
             }
 
             string hostHeader = null;
-            if (_host != null)
+            if (_originAuthority != null)
             {
                 // Precalculate ASCII bytes for Host header
                 // Note that if _host is null, this is a (non-tunneled) proxy connection, and we can't cache the hostname.
                 hostHeader =
-                    (_port != (sslHostName == null ? DefaultHttpPort : DefaultHttpsPort)) ?
-                    $"{_host}:{_port}" :
-                    _host;
+                    (_originAuthority.Port != (sslHostName == null ? DefaultHttpPort : DefaultHttpsPort)) ?
+                    $"{_originAuthority.IdnHost}:{_originAuthority.Port}" :
+                    _originAuthority.IdnHost;
 
                 // Note the IDN hostname should always be ASCII, since it's already been IDNA encoded.
                 _hostHeaderValueBytes = Encoding.ASCII.GetBytes(hostHeader);
@@ -212,6 +242,7 @@ namespace System.Net.Http
             return sslOptions;
         }
 
+        public HttpAuthority OriginAuthority => _originAuthority;
         public HttpConnectionSettings Settings => _poolManager.Settings;
         public bool IsSecure => _sslOptionsHttp11 != null;
         public HttpConnectionKind Kind => _kind;
@@ -220,6 +251,35 @@ namespace System.Net.Http
         public ICredentials ProxyCredentials => _poolManager.ProxyCredentials;
         public byte[] HostHeaderValueBytes => _hostHeaderValueBytes;
         public CredentialCache PreAuthCredentials { get; }
+
+        public byte[] Http2AltSvcOriginUri
+        {
+            get
+            {
+                if (_http2AltSvcOriginUri == null)
+                {
+                    // This builds an ASCII origin string per RFC 6454 Section 6.2
+                    // <scheme>://<host>[:<port>]
+
+                    var sb = new StringBuilder();
+
+                    sb
+                        .Append(_kind == HttpConnectionKind.Https ? "https://" : "http://")
+                        .Append(_originAuthority.IdnHost);
+
+                    if (_originAuthority.Port != (_kind == HttpConnectionKind.Https ? DefaultHttpsPort : DefaultHttpPort))
+                    {
+                        sb
+                            .Append(':')
+                            .Append(_originAuthority.Port.ToString(CultureInfo.InvariantCulture));
+                    }
+
+                    _http2AltSvcOriginUri = Encoding.ASCII.GetBytes(sb.ToString());
+                }
+
+                return _http2AltSvcOriginUri;
+            }
+        }
 
         /// <summary>Object used to synchronize access to state in the pool.</summary>
         private object SyncObj => _idleConnections;
@@ -529,15 +589,17 @@ namespace System.Net.Http
                     return failureResponse;
                 }
 
+                HttpResponseMessage response;
+
                 try
                 {
                     if (connection is HttpConnection)
                     {
-                        return await SendWithNtConnectionAuthAsync((HttpConnection)connection, request, doRequestAuth, cancellationToken).ConfigureAwait(false);
+                        response = await SendWithNtConnectionAuthAsync((HttpConnection)connection, request, doRequestAuth, cancellationToken).ConfigureAwait(false);
                     }
                     else
                     {
-                        return await connection.SendAsync(request, cancellationToken).ConfigureAwait(false);
+                        response = await connection.SendAsync(request, cancellationToken).ConfigureAwait(false);
                     }
                 }
                 catch (HttpRequestException e) when (!isNewConnection && e.AllowRetry == RequestRetryType.RetryOnSameOrNextProxy)
@@ -548,7 +610,169 @@ namespace System.Net.Http
                     }
 
                     // Eat exception and try again.
+                    continue;
                 }
+
+                if (_altSvcEnabled && response.Headers.AltSvc.Count != 0)
+                {
+                    HandleAltSvc(response.Headers.AltSvc);
+                }
+
+                // If an Alt-Svc authority returns 421, it means it can't actually handle the request.
+                // An authority is supposed to be able to handle ALL requests to the origin, so this is a server bug.
+                // In this case, we blacklist the authority and retry the request at the origin.
+                if (response.StatusCode == HttpStatusCode.MisdirectedRequest && connection.Authority != _originAuthority)
+                {
+                    response.Dispose();
+                    HandleBadAltSvc(connection.Authority);
+                    continue;
+                }
+
+                return response;
+            }
+        }
+
+        /// <summary>
+        /// Inspects a collection of Alt-Svc headers to find the first eligible upgrade path.
+        /// </summary>
+        internal void HandleAltSvc(IEnumerable<AltSvcHeaderValue> altSvcHeaderValues, TimeSpan? responseAge)
+        {
+            HttpAuthority nextAuthority = null;
+            TimeSpan nextAuthorityMaxAge = default;
+
+            foreach (AltSvcHeaderValue value in altSvcHeaderValues)
+            {
+                // 'clear' should be the only value present.
+                if (value == AltSvcHeaderValue.Clear)
+                {
+                    _http3Authority = _originAuthority;
+                    break;
+                }
+
+                if (nextAuthority == null && value.AlpnProtocolName == "h3")
+                {
+                    var authority = new HttpAuthority(value.Host, value.Port);
+
+                    if (_altSvcBlacklist != null)
+                    {
+                        lock (_altSvcBlacklist)
+                        {
+                            if (_altSvcBlacklist.Contains(authority))
+                            {
+                                // Skip authorities in our blacklist.
+                                continue;
+                            }
+                        }
+                    }
+
+                    TimeSpan authorityMaxAge = value.MaxAge;
+
+                    if (responseAge != null)
+                    {
+                        authorityMaxAge -= responseAge.GetValueOrDefault();
+                    }
+
+                    if (authorityMaxAge > TimeSpan.Zero)
+                    {
+                        nextAuthority = authority;
+                        nextAuthorityMaxAge = authorityMaxAge;
+                    }
+                }
+            }
+
+            // There's a race here in checking _http3Authority outside of the lock,
+            // but there's really no bad behavior if _http3Authority changes in the mean time.
+            if (nextAuthority != null && !nextAuthority.Equals(_http3Authority))
+            {
+                // Clamp the max age to 30 days... this is arbitrary but prevents passing a too-large TimeSpan to the Timer.
+                if (nextAuthorityMaxAge.Ticks > (30 * TimeSpan.TicksPerDay))
+                {
+                    nextAuthorityMaxAge = TimeSpan.FromTicks(30 * TimeSpan.TicksPerDay);
+                }
+
+                lock (SyncObj)
+                {
+                    if (_authorityExpireTimer == null)
+                    {
+                        var thisRef = new WeakReference<HttpConnectionPool>(this);
+
+                        _authorityExpireTimer = new Timer(o =>
+                        {
+                            var wr = (WeakReference<HttpConnectionPool>)o;
+                            if (wr.TryGetTarget(out HttpConnectionPool @this))
+                            {
+                                @this._http3Authority = @this._originAuthority;
+                            }
+                        }, thisRef, nextAuthorityMaxAge, Timeout.InfiniteTimeSpan);
+                    }
+                    else
+                    {
+                        _authorityExpireTimer.Change(nextAuthorityMaxAge, Timeout.InfiniteTimeSpan);
+                    }
+
+                    _http3Authority = nextAuthority;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Blacklists an authority and resets the current authority back to origin.
+        /// </summary>
+        private void HandleBadAltSvc(HttpAuthority badAuthority)
+        {
+            Debug.Assert(badAuthority != null);
+            Debug.Assert(badAuthority != _originAuthority);
+
+            HashSet<HttpAuthority> collection = _altSvcBlacklist;
+
+            if (collection == null)
+            {
+                lock (SyncObj)
+                {
+                    collection = _altSvcBlacklist;
+                    if (collection == null)
+                    {
+                        collection = new HashSet<HttpAuthority>();
+                        _altSvcBlacklistTimerCancellation = new CancellationTokenSource();
+                        _altSvcBlacklist = collection;
+                    }
+                }
+            }
+
+            bool added, disabled = false;
+
+            lock (collection)
+            {
+                added = collection.Add(badAuthority);
+
+                if (added && collection.Count >= MaxAltSvcIgnoreListSize && _altSvcEnabled)
+                {
+                    _altSvcEnabled = false;
+                    disabled = true;
+                }
+            }
+
+            _http3Authority = _originAuthority;
+
+            if (added)
+            {
+                _ = Task.Delay(AltSvcBlacklistTimeoutInMilliseconds)
+                    .ContinueWith(t =>
+                    {
+                        lock (collection)
+                        {
+                            collection.Remove(badAuthority);
+                        }
+                    }, _altSvcBlacklistTimerCancellation.Token, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+            }
+
+            if (disabled)
+            {
+                _ = Task.Delay(AltSvcBlacklistTimeoutInMilliseconds)
+                    .ContinueWith(t =>
+                    {
+                        _altSvcEnabled = true;
+                    }, _altSvcBlacklistTimerCancellation.Token, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
             }
         }
 
@@ -622,7 +846,7 @@ namespace System.Net.Http
                     case HttpConnectionKind.Http:
                     case HttpConnectionKind.Https:
                     case HttpConnectionKind.ProxyConnect:
-                        stream = await ConnectHelper.ConnectAsync(_host, _port, cancellationToken).ConfigureAwait(false);
+                        stream = await ConnectHelper.ConnectAsync(_originAuthority.IdnHost, _originAuthority.Port, cancellationToken).ConfigureAwait(false);
                         break;
 
                     case HttpConnectionKind.Proxy:
@@ -685,7 +909,7 @@ namespace System.Net.Http
         {
             // Send a CONNECT request to the proxy server to establish a tunnel.
             HttpRequestMessage tunnelRequest = new HttpRequestMessage(HttpMethod.Connect, _proxyUri);
-            tunnelRequest.Headers.Host = $"{_host}:{_port}";    // This specifies destination host/port to connect to
+            tunnelRequest.Headers.Host = $"{_originAuthority.IdnHost}:{_originAuthority.Port}";    // This specifies destination host/port to connect to
 
             if (headers != null && headers.TryGetValues(HttpKnownHeaderNames.UserAgent, out IEnumerable<string> values))
             {
@@ -901,6 +1125,19 @@ namespace System.Net.Http
                         _http2Connection.Dispose();
                         _http2Connection = null;
                     }
+
+                    if (_authorityExpireTimer != null)
+                    {
+                        _authorityExpireTimer.Dispose();
+                        _authorityExpireTimer = null;
+                    }
+
+                    if (_altSvcBlacklistTimerCancellation != null)
+                    {
+                        _altSvcBlacklistTimerCancellation.Cancel();
+                        _altSvcBlacklistTimerCancellation.Dispose();
+                        _altSvcBlacklistTimerCancellation = null;
+                    }
                 }
                 Debug.Assert(list.Count == 0, $"Expected {nameof(list)}.{nameof(list.Count)} == 0");
             }
@@ -1032,11 +1269,11 @@ namespace System.Net.Http
             $"{nameof(HttpConnectionPool)} " +
             (_proxyUri == null ?
                 (_sslOptionsHttp11 == null ?
-                    $"http://{_host}:{_port}" :
-                    $"https://{_host}:{_port}" + (_sslOptionsHttp11.TargetHost != _host ? $", SSL TargetHost={_sslOptionsHttp11.TargetHost}" : null)) :
+                    $"http://{_originAuthority}" :
+                    $"https://{_originAuthority}" + (_sslOptionsHttp11.TargetHost != _originAuthority.IdnHost ? $", SSL TargetHost={_sslOptionsHttp11.TargetHost}" : null)) :
                 (_sslOptionsHttp11 == null ?
                     $"Proxy {_proxyUri}" :
-                    $"https://{_host}:{_port}/ tunnelled via Proxy {_proxyUri}" + (_sslOptionsHttp11.TargetHost != _host ? $", SSL TargetHost={_sslOptionsHttp11.TargetHost}" : null)));
+                    $"https://{_originAuthority}/ tunnelled via Proxy {_proxyUri}" + (_sslOptionsHttp11.TargetHost != _originAuthority.IdnHost ? $", SSL TargetHost={_sslOptionsHttp11.TargetHost}" : null)));
 
         private void Trace(string message, [CallerMemberName] string memberName = null) =>
             NetEventSource.Log.HandlerMessage(
