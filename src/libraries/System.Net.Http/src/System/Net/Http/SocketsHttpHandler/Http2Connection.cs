@@ -5,6 +5,7 @@
 using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Net.Http.Headers;
 using System.Net.Http.HPack;
@@ -49,6 +50,8 @@ namespace System.Net.Http
         private long _idleSinceTickCount;
         private int _pendingWriters;
         private bool _lastPendingWriterShouldFlush;
+
+        private byte[] _encodedAltUsedHeader;
 
         // This means that the pool has disposed us, but there may still be
         // requests in flight that will continue to be processed.
@@ -100,7 +103,7 @@ namespace System.Net.Http
         // this value, so this is not a hard maximum size.
         private const int UnflushedOutgoingBufferSize = 32 * 1024;
 
-        public Http2Connection(HttpConnectionPool pool, Stream stream)
+        public Http2Connection(HttpConnectionPool pool, Stream stream, string altSvcHost, int altSvcPort)
         {
             _pool = pool;
             _stream = stream;
@@ -121,6 +124,11 @@ namespace System.Net.Http
             _initialWindowSize = DefaultInitialWindowSize;
             _maxConcurrentStreams = int.MaxValue;
             _pendingWindowUpdate = 0;
+
+            if (altSvcHost != null)
+            {
+                _encodedAltUsedHeader = HPackEncoder.EncodeLiteralHeaderFieldWithoutIndexingNewNameToAllocatedArray(KnownHeaders.AltSvc.Name, altSvcHost + ":" + altSvcPort.ToString(CultureInfo.InvariantCulture));
+            }
 
             if (NetEventSource.IsEnabled) TraceConnection(stream);
         }
@@ -273,6 +281,10 @@ namespace System.Net.Http
 
                         case FrameType.GoAway:
                             ProcessGoAwayFrame(frameHeader);
+                            break;
+
+                        case FrameType.AltSvc:
+                            ProcessAltSvcFrame(frameHeader);
                             break;
 
                         case FrameType.PushPromise:     // Should not happen, since we disable this in our initial SETTINGS (TODO: ISSUE 31295: We aren't currently, but we should)
@@ -680,6 +692,46 @@ namespace System.Net.Http
             _incomingBuffer.Discard(frameHeader.Length);
         }
 
+        /// <summary>
+        /// Parses ALTSVC frame per RFC7838.
+        /// </summary>
+        private void ProcessAltSvcFrame(FrameHeader frameHeader)
+        {
+            Debug.Assert(frameHeader.Type == FrameType.AltSvc);
+
+            ReadOnlySpan<byte> buffer = _incomingBuffer.ActiveSpan;
+
+            if (!BinaryPrimitives.TryReadUInt16BigEndian(buffer, out ushort originLength))
+            {
+                throw new Http2ConnectionException(Http2ProtocolErrorCode.FrameSizeError);
+            }
+
+            if (frameHeader.StreamId == 0)
+            {
+                if (originLength == 0) return; // Per RFC, Stream 0 with 0-length origin must be ignored.
+            }
+            else if (originLength != 0)
+            {
+                return; // Per RFC, Stream != 0 with a >0-length origin must be ignored.
+            }
+
+            if (buffer.Length < (2 + originLength))
+            {
+                throw new Http2ConnectionException(Http2ProtocolErrorCode.FrameSizeError);
+            }
+
+            ReadOnlySpan<byte> origin = buffer.Slice(2, originLength);
+
+            if (origin.Length != 0)
+            {
+                // if origin is != to our pool's expected origin, ignore.
+            }
+
+            ReadOnlySpan<byte> altSvcFieldValue = buffer.Slice(2 + originLength);
+
+            //TODO parse.
+        }
+
         internal async Task FlushAsync(CancellationToken cancellationToken = default)
         {
             await StartWriteAsync(0, cancellationToken).ConfigureAwait(false);
@@ -1040,6 +1092,11 @@ namespace System.Net.Http
             else
             {
                 WriteBytes(_pool._encodedAuthorityHostHeader);
+            }
+
+            if (_encodedAltUsedHeader != null)
+            {
+                WriteBytes(_encodedAltUsedHeader);
             }
 
             string pathAndQuery = request.RequestUri.PathAndQuery;
@@ -1534,8 +1591,9 @@ namespace System.Net.Http
             GoAway = 7,
             WindowUpdate = 8,
             Continuation = 9,
+            AltSvc = 10,
 
-            Last = 9
+            Last = 10
         }
 
         private struct FrameHeader

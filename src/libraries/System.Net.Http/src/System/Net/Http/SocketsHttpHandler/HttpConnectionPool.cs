@@ -30,6 +30,14 @@ namespace System.Net.Http
         private readonly Uri _proxyUri;
         internal readonly byte[] _encodedAuthorityHostHeader;
 
+        private string _altSvcHost;
+        private int _altSvcPort;
+        private long _altSvcExpireTicks;
+        private byte[] _encodedAltUsedHeader;
+        private Http2Connection _altSvcHttp2Connection;
+        private bool _altSvcHttp2ConnectionInProgress;
+        private readonly List<CachedConnection> _altSvcIdleConnections = new List<CachedConnection>();
+
         /// <summary>List of idle connections stored in the pool.</summary>
         private readonly List<CachedConnection> _idleConnections = new List<CachedConnection>();
         /// <summary>The maximum number of connections allowed to be associated with the pool.</summary>
@@ -531,14 +539,26 @@ namespace System.Net.Http
 
                 try
                 {
+                    HttpResponseMessage response;
+
                     if (connection is HttpConnection)
                     {
-                        return await SendWithNtConnectionAuthAsync((HttpConnection)connection, request, doRequestAuth, cancellationToken).ConfigureAwait(false);
+                        response = await SendWithNtConnectionAuthAsync((HttpConnection)connection, request, doRequestAuth, cancellationToken).ConfigureAwait(false);
                     }
                     else
                     {
-                        return await connection.SendAsync(request, cancellationToken).ConfigureAwait(false);
+                        response = await connection.SendAsync(request, cancellationToken).ConfigureAwait(false);
                     }
+
+                    if (response.Headers.TryGetValues(KnownHeaders.AltSvc.Name, out IEnumerable<string> altSvcValues))
+                    {
+                        lock (SyncObj)
+                        {
+                            _altSvcHost = 
+                        }
+                    }
+
+                    return response;
                 }
                 catch (HttpRequestException e) when (!isNewConnection && e.AllowRetry == RequestRetryType.RetryOnSameOrNextProxy)
                 {

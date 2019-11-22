@@ -67,11 +67,14 @@ namespace System.Net.Http
         private bool _connectionClose; // Connection: close was seen on last response
         private int _disposed; // 1 yes, 0 no
 
+        private readonly byte[] _encodedAltUsedHeader;
+
         public HttpConnection(
             HttpConnectionPool pool,
             Socket socket,
             Stream stream,
-            TransportContext transportContext)
+            TransportContext transportContext,
+            byte[] encodedAltUsedHeader)
         {
             Debug.Assert(pool != null);
             Debug.Assert(stream != null);
@@ -85,6 +88,8 @@ namespace System.Net.Http
             _readBuffer = new byte[InitialReadBufferSize];
 
             _weakThisRef = new WeakReference<HttpConnection>(this);
+
+            _encodedAltUsedHeader = encodedAltUsedHeader;
 
             if (NetEventSource.IsEnabled) TraceConnection(_stream);
         }
@@ -113,6 +118,11 @@ namespace System.Net.Http
                     }
                 }
             }
+        }
+
+        private byte[] EncodeAltUsedHeader(string host, int port)
+        {
+            byte[] buffer = KnownHeaders.AltUsed.
         }
 
         /// <summary>Do a non-blocking poll to see whether the connection has data available or has been closed.</summary>
@@ -398,6 +408,12 @@ namespace System.Net.Http
                 if (!request.HasHeaders || request.Headers.Host == null)
                 {
                     await WriteHostHeaderAsync(request.RequestUri).ConfigureAwait(false);
+                }
+
+                // For connections opened using Alt-Svc, write an Alt-Used to indicate the alternate being connected to.
+                if (_encodedAltUsedHeader != null)
+                {
+                    await WriteBytesAsync(_encodedAltUsedHeader).ConfigureAwait(false);
                 }
 
                 // Write request headers
@@ -1832,7 +1848,7 @@ namespace System.Net.Http
 
     internal sealed class HttpConnectionWithFinalizer : HttpConnection
     {
-        public HttpConnectionWithFinalizer(HttpConnectionPool pool, Socket socket, Stream stream, TransportContext transportContext) : base(pool, socket, stream, transportContext) { }
+        public HttpConnectionWithFinalizer(HttpConnectionPool pool, Socket socket, Stream stream, TransportContext transportContext, byte[] encodedAltUsedHeader) : base(pool, socket, stream, transportContext, encodedAltUsedHeader) { }
 
         // This class is separated from HttpConnection so we only pay the price of having a finalizer
         // when it's actually needed, e.g. when MaxConnectionsPerServer is enabled.
