@@ -2,7 +2,6 @@
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
-using System.Net.Http.System.Net.Http.Headers;
 using System.Resources;
 using System.Text;
 using System.Threading;
@@ -12,8 +11,10 @@ namespace System.Net.Http.Headers
 {
     internal class AltSvcHeaderParser : BaseHeaderParser
     {
+        private const long DefaultMaxAgeTicks = 24 * TimeSpan.TicksPerHour;
+
         public AltSvcHeaderParser()
-            : base(true)
+            : base(supportsMultipleValues: true)
         {
         }
 
@@ -21,8 +22,9 @@ namespace System.Net.Http.Headers
             out object parsedValue)
         {
             Debug.Assert(startIndex >= 0);
+            Debug.Assert(startIndex < value.Length);
 
-            if (string.IsNullOrEmpty(value) || startIndex >= value.Length)
+            if (string.IsNullOrEmpty(value))
             {
                 parsedValue = null;
                 return 0;
@@ -30,32 +32,37 @@ namespace System.Net.Http.Headers
 
             int idx = startIndex;
 
-            int alpnProtocolNameLength = HttpRuleParser.GetTokenLength(value, idx);
-            string alpnProtocolName = ReadPercentEncodedAlpnProtocolName(value.AsSpan(idx, alpnProtocolNameLength));
-            if (alpnProtocolName == null)
+            if (!TryReadPercentEncodedAlpnProtocolName(value, idx, out string alpnProtocolName, out int alpnProtocolNameLength))
             {
-                throw new Exception("Unknown ALPN protocol name.");
+                parsedValue = null;
+                return 0; // TODO: this (and other failures) should skip the entire remaining header line?
             }
+
             idx += alpnProtocolNameLength;
 
-            // Clear should be used alone with no parameters.
-            if (ReferenceEquals(alpnProtocolName, "clear"))
+            if (alpnProtocolName == "clear")
             {
-                var ret = new AltSvcHeaderValue();
-                ret.Alternatives.Add(AlternateService.Clear);
+                if (idx != value.Length)
+                {
+                    // Clear has no parameters and should be the only Alt-Svc value present, so there should be nothing after it.
+                    parsedValue = null;
+                    return 0;
+                }
 
-                parsedValue = ret;
+                parsedValue = AlternateService.Clear;
                 return idx - startIndex;
             }
 
             if (idx == value.Length || value[idx++] != '=')
             {
-                throw new Exception("Invalid alternative, expected '='.");
+                parsedValue = null;
+                return 0;
             }
 
-            if (!TryReadAltAuthority(value, idx, out string altAuthorityHost, out int altAuthorityPort, out int altAuthorityLength))
+            if (!TryReadQuotedAltAuthority(value, idx, out string altAuthorityHost, out int altAuthorityPort, out int altAuthorityLength))
             {
-                throw new Exception("Invalid alt-authority, excepected quoted string.");
+                parsedValue = null;
+                return 0;
             }
             idx += altAuthorityLength;
 
@@ -71,39 +78,58 @@ namespace System.Net.Http.Headers
                 int tokenLength = HttpRuleParser.GetTokenLength(value, idx);
                 if (tokenLength == 0)
                 {
-                    // End of header.
+                    // End of header, or end of segment in a multi-value header.
                     break;
                 }
 
                 if (value[idx + tokenLength + 1] != '=')
                 {
-                    throw new Exception("Expected = in parameter.");
+                    parsedValue = null;
+                    return 0;
                 }
 
                 if (tokenLength == 2 && value[idx] == 'm' && value[idx + 1] == 'a')
                 {
-                    // Parse "ma" or Max Age.
+                    // Parse "ma" (Max Age).
 
-                    idx += 3;
-                    if (TryReadTokenOrQuotedInt32(value, idx, out int maxAgeTmp, out int parameterLength))
+                    idx += 3; // Skip "ma="
+                    if (!TryReadTokenOrQuotedInt32(value, idx, out int maxAgeTmp, out int parameterLength))
                     {
-                        // TODO: what is behavior if duplicate parameter found?
-                        maxAge ??= maxAgeTmp;
+                        parsedValue = null;
+                        return 0;
                     }
+
+                    if (maxAge == null)
+                    {
+                        maxAge = maxAgeTmp;
+                    }
+                    else
+                    {
+                        // RFC makes it unclear what to do if a duplciate parameter is found. For now, take the minimum.
+                        maxAge = Math.Min(maxAge.GetValueOrDefault(), maxAgeTmp);
+                    }
+
                     idx += parameterLength;
                 }
                 else
                 {
-                    // Some unknown parameter.
+                    // Some unknown parameter. Skip it.
+
                     idx += tokenLength + 1;
                     if (!TrySkipTokenOrQuoted(value, idx, out int parameterLength))
                     {
+                        parsedValue = null;
+                        return 0;
                     }
-
+                    idx += parameterLength;
                 }
-
-
             }
+
+            // If no "ma" parameter present, use the default.
+            var maxAgeTimeSpan = new TimeSpan(maxAge * TimeSpan.TicksPerSecond ?? DefaultMaxAgeTicks);
+
+            parsedValue = new AlternateService(alpnProtocolName, altAuthorityHost, altAuthorityPort, maxAgeTimeSpan);
+            return idx - startIndex;
         }
 
         private static bool IsOptionalWhiteSpace(char ch)
@@ -111,27 +137,55 @@ namespace System.Net.Http.Headers
             return ch == ' ' || ch == '\t';
         }
 
-        private static string ReadPercentEncodedAlpnProtocolName(ReadOnlySpan<char> span)
+        private static bool TryReadPercentEncodedAlpnProtocolName(string value, int startIndex, out string result, out int readLength)
         {
+            int tokenLength = HttpRuleParser.GetTokenLength(value, startIndex);
+
+            if (tokenLength == 0)
+            {
+                result = null;
+                readLength = 0;
+                return false;
+            }
+
+            ReadOnlySpan<char> span = value.AsSpan(startIndex, tokenLength);
+
+            readLength = tokenLength;
+
+            // Special-case expected values to avoid allocating one-off strings.
             switch (span.Length)
             {
                 case 2:
                     if (span[0] == 'h')
                     {
                         char ch = span[1];
-                        if (ch == '3') return "h3";
-                        if (ch == '2') return "h2";
+                        if (ch == '3')
+                        {
+                            result = "h3";
+                            return true;
+                        }
+                        if (ch == '2')
+                        {
+                            result = "h2";
+                            return true;
+                        }
                     }
-                    goto default;
+                    break;
                 case 3:
                     if (span[0] == 'h' && span[1] == '2' && span[2] == 'c')
                     {
-                        return "h2c";
+                        result = "h2c";
+                        readLength = 3;
+                        return true;
                     }
-                    goto default;
+                    break;
                 case 5:
-                    if (span.SequenceEqual("clear")) return "clear";
-                    goto default;
+                    if (span.SequenceEqual("clear"))
+                    {
+                        result = "clear";
+                        return true;
+                    }
+                    break;
                 case 10:
                     if (span.StartsWith("http%2") && span[7] == '1' && span[8] == '.')
                     {
@@ -139,20 +193,92 @@ namespace System.Net.Http.Headers
                         if (ch == 'F' || ch == 'f')
                         {
                             ch = span[9];
-                            if (ch == '1') return "http/1.1";
-                            if (ch == '0') return "http/1.0";
+                            if (ch == '1')
+                            {
+                                result = "http/1.1";
+                                return true;
+                            }
+                            if (ch == '0')
+                            {
+                                result = "http/1.0";
+                                return true;
+                            }
                         }
                     }
-
-                    goto default;
-                default:
-                    // Unrecognized ALPN protocol name.
-                    // It could be percent-decoded and returned, but that's not needed given current implementation.
-                    return null;
+                    break;
             }
+
+            // Unrecognized ALPN protocol name. Percent-decode.
+            return TryReadPercentEncodedValue(span, out result);
+
         }
 
-        private static bool TryReadAltAuthority(string value, int startIndex, out string host, out int port, out int readLength)
+        private static bool TryReadPercentEncodedValue(ReadOnlySpan<char> value, out string result)
+        {
+            int idx = value.IndexOf('%');
+
+            if (idx == -1)
+            {
+                result = new string(value);
+                return true;
+            }
+
+            var builder = new ValueStringBuilder(value.Length <= 128 ? stackalloc char[128] : new char[value.Length]);
+
+            do
+            {
+                if (idx != 0)
+                {
+                    builder.Append(value.Slice(0, idx));
+                }
+
+                if ((value.Length - idx) < 3 || !TryReadHexDigit(value[1], out int hi) || !TryReadHexDigit(value[2], out int lo))
+                {
+                    result = null;
+                    return false;
+                }
+
+                builder.Append((char)((hi << 8) | lo));
+
+                value = value.Slice(idx + 3);
+                idx = value.IndexOf('%');
+            }
+            while (idx != -1);
+
+            if (value.Length != 0)
+            {
+                builder.Append(value);
+            }
+
+            result = builder.ToString();
+            return true;
+        }
+
+        private static bool TryReadHexDigit(char ch, out int nibble)
+        {
+            if (ch >= '0' && ch <= '9')
+            {
+                nibble = ch - '0';
+                return true;
+            }
+
+            if (ch >= 'a' && ch <= 'f')
+            {
+                nibble = ch - 'a' + 10;
+                return true;
+            }
+
+            if (ch >= 'A' && ch <= 'F')
+            {
+                nibble = ch - 'a' + 10;
+                return true;
+            }
+
+            nibble = 0;
+            return false;
+        }
+
+        private static bool TryReadQuotedAltAuthority(string value, int startIndex, out string host, out int port, out int readLength)
         {
             if (HttpRuleParser.GetQuotedStringLength(value, startIndex, out int quotedLength) != HttpParseResult.Parsed)
             {
@@ -168,14 +294,14 @@ namespace System.Net.Http.Headers
                 goto parseError;
             }
 
-            // Parse out the port.
+            // Parse the port. Port comes at the end of the string, but do this first so we don't allocate a host string if port fails to parse.
             if (!TryReadQuotedInt32Value(quoted.Slice(idx + 1), out port))
             {
                 goto parseError;
             }
 
-            // Parse out the optional host.
-            if (--idx == 0)
+            // Parse the optional host.
+            if (idx == 0)
             {
                 host = null;
             }
