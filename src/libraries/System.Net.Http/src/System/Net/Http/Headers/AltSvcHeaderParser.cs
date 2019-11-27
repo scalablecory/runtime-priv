@@ -67,26 +67,42 @@ namespace System.Net.Http.Headers
                 // Skip OWS.
                 while (idx != value.Length && IsOptionalWhiteSpace(value[idx])) ++idx;
 
-                // get the parameter key length.
+                // Get the parameter key length.
                 int tokenLength = HttpRuleParser.GetTokenLength(value, idx);
                 if (tokenLength == 0)
                 {
+                    // End of header.
                     break;
                 }
 
-                if (tokenLength + 1 != '=')
+                if (value[idx + tokenLength + 1] != '=')
                 {
                     throw new Exception("Expected = in parameter.");
                 }
 
                 if (tokenLength == 2 && value[idx] == 'm' && value[idx + 1] == 'a')
                 {
-                    maxAge = 
+                    // Parse "ma" or Max Age.
+
+                    idx += 3;
+                    if (TryReadTokenOrQuotedInt32(value, idx, out int maxAgeTmp, out int parameterLength))
+                    {
+                        // TODO: what is behavior if duplicate parameter found?
+                        maxAge ??= maxAgeTmp;
+                    }
+                    idx += parameterLength;
+                }
+                else
+                {
+                    // Some unknown parameter.
+                    idx += tokenLength + 1;
+                    if (!TrySkipTokenOrQuoted(value, idx, out int parameterLength))
+                    {
+                    }
+
                 }
 
-                int parameterIdx = idx;
 
-                if()
             }
         }
 
@@ -138,7 +154,7 @@ namespace System.Net.Http.Headers
 
         private static bool TryReadAltAuthority(string value, int startIndex, out string host, out int port, out int readLength)
         {
-            if (HttpRuleParser.GetQuotedStringLength(value, startIndex, out int quotedLength) == HttpParseResult.Parsed)
+            if (HttpRuleParser.GetQuotedStringLength(value, startIndex, out int quotedLength) != HttpParseResult.Parsed)
             {
                 goto parseError;
             }
@@ -153,7 +169,7 @@ namespace System.Net.Http.Headers
             }
 
             // Parse out the port.
-            if (!TryUnquotePort(quoted.Slice(idx + 1), out port))
+            if (!TryReadQuotedInt32Value(quoted.Slice(idx + 1), out port))
             {
                 goto parseError;
             }
@@ -222,7 +238,37 @@ namespace System.Net.Http.Headers
             return true;
         }
 
-        private static bool TryReadQuotedInt32(ReadOnlySpan<char> value, out int result)
+        private static bool TryReadTokenOrQuotedInt32(string value, int startIndex, out int result, out int readLength)
+        {
+            if (startIndex >= value.Length)
+            {
+                result = 0;
+                readLength = 0;
+                return false;
+            }
+
+            if (HttpRuleParser.IsTokenChar(value[startIndex]))
+            {
+                // No reason for integers to be quoted, so this should be the hot path.
+
+                int tokenLength = HttpRuleParser.GetTokenLength(value, startIndex);
+
+                readLength = tokenLength;
+                return HeaderUtilities.TryParseInt32(value, startIndex, tokenLength, out result);
+            }
+
+            if (HttpRuleParser.GetQuotedStringLength(value, startIndex, out int quotedLength) == HttpParseResult.Parsed)
+            {
+                readLength = quotedLength;
+                return TryReadQuotedInt32Value(value.AsSpan(1, quotedLength - 2), out result);
+            }
+
+            result = 0;
+            readLength = 0;
+            return false;
+        }
+
+        private static bool TryReadQuotedInt32Value(ReadOnlySpan<char> value, out int result)
         {
             if (value.Length == 0)
             {
@@ -232,30 +278,54 @@ namespace System.Net.Http.Headers
 
             int port = 0;
 
-            try
+            foreach (char ch in value)
             {
-                foreach (char ch in value)
+                // The port shouldn't ever need a quoted-pair, but they're still valid... skip if found.
+                if (ch == '\\') continue;
+
+                if (ch < '0' || ch > '9')
                 {
-                    // The port shouldn't ever need a quoted-pair, but they're still valid... skip if found.
-                    if (ch == '\\') continue;
-
-                    if (ch < '0' || ch > '9')
-                    {
-                        result = 0;
-                        return false;
-                    }
-
-                    checked
-                    {
-                        port = port * 10 + (ch - '0');
-                    }
+                    result = 0;
+                    return false;
                 }
+
+                long portTmp = port * 10L + (ch - '0');
+
+                if (portTmp > int.MaxValue)
+                {
+                    result = 0;
+                    return false;
+                }
+
+                port = (int)portTmp;
             }
 
             result = port;
             return true;
         }
 
-        private static bool TryReadTokenOrQuotedString(string value, int startIndex, out string)
+        private static bool TrySkipTokenOrQuoted(string value, int startIndex, out int readLength)
+        {
+            if (startIndex >= value.Length)
+            {
+                readLength = 0;
+                return false;
+            }
+
+            if (HttpRuleParser.IsTokenChar(value[startIndex]))
+            {
+                readLength = HttpRuleParser.GetTokenLength(value, startIndex);
+                return true;
+            }
+
+            if (HttpRuleParser.GetQuotedStringLength(value, startIndex, out int quotedLength) == HttpParseResult.Parsed)
+            {
+                readLength = quotedLength;
+                return true;
+            }
+
+            readLength = 0;
+            return false;
+        }
     }
 }
