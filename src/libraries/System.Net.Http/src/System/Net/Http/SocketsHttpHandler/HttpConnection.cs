@@ -122,7 +122,8 @@ namespace System.Net.Http
 
         private byte[] EncodeAltUsedHeader(string host, int port)
         {
-            byte[] buffer = KnownHeaders.AltUsed.
+            //byte[] buffer = KnownHeaders.AltUsed.
+            return null;
         }
 
         /// <summary>Do a non-blocking poll to see whether the connection has data available or has been closed.</summary>

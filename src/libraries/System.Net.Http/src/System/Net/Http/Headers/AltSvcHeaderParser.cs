@@ -1,4 +1,8 @@
-﻿using System;
+﻿// Licensed to the .NET Foundation under one or more agreements.
+// The .NET Foundation licenses this file to you under the MIT license.
+// See the LICENSE file in the project root for more information.
+
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
@@ -11,9 +15,11 @@ namespace System.Net.Http.Headers
 {
     internal class AltSvcHeaderParser : BaseHeaderParser
     {
-        private const long DefaultMaxAgeTicks = 24 * TimeSpan.TicksPerHour;
+        internal const long DefaultMaxAgeTicks = 24 * TimeSpan.TicksPerHour;
 
-        public AltSvcHeaderParser()
+        public static AltSvcHeaderParser Parser { get; } = new AltSvcHeaderParser();
+
+        private AltSvcHeaderParser()
             : base(supportsMultipleValues: true)
         {
         }
@@ -66,23 +72,32 @@ namespace System.Net.Http.Headers
             }
             idx += altAuthorityLength;
 
-            // Parse parameters.
+            // Parse parameters: *( OWS ";" OWS parameter )
             int? maxAge = null;
 
             while (idx != value.Length)
             {
-                // Skip OWS.
+                // Skip OWS before semicolon.
+                while (idx != value.Length && IsOptionalWhiteSpace(value[idx])) ++idx;
+
+                if (idx == value.Length || value[idx++] != ';')
+                {
+                    parsedValue = null;
+                    return 0;
+                }
+
+                // Skip OWS after semicolon / before value.
                 while (idx != value.Length && IsOptionalWhiteSpace(value[idx])) ++idx;
 
                 // Get the parameter key length.
                 int tokenLength = HttpRuleParser.GetTokenLength(value, idx);
                 if (tokenLength == 0)
                 {
-                    // End of header, or end of segment in a multi-value header.
-                    break;
+                    parsedValue = null;
+                    return 0;
                 }
 
-                if (value[idx + tokenLength + 1] != '=')
+                if ((idx + tokenLength) >= value.Length || value[idx + tokenLength] != '=')
                 {
                     parsedValue = null;
                     return 0;

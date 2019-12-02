@@ -30,13 +30,13 @@ namespace System.Net.Http
         private readonly Uri _proxyUri;
         internal readonly byte[] _encodedAuthorityHostHeader;
 
-        private string _altSvcHost;
-        private int _altSvcPort;
-        private long _altSvcExpireTicks;
-        private byte[] _encodedAltUsedHeader;
-        private Http2Connection _altSvcHttp2Connection;
-        private bool _altSvcHttp2ConnectionInProgress;
-        private readonly List<CachedConnection> _altSvcIdleConnections = new List<CachedConnection>();
+        //private string _altSvcHost;
+        //private int _altSvcPort;
+        //private long _altSvcExpireTicks;
+        //private byte[] _encodedAltUsedHeader;
+        //private Http2Connection _altSvcHttp2Connection;
+        //private bool _altSvcHttp2ConnectionInProgress;
+        //private readonly List<CachedConnection> _altSvcIdleConnections = new List<CachedConnection>();
 
         /// <summary>List of idle connections stored in the pool.</summary>
         private readonly List<CachedConnection> _idleConnections = new List<CachedConnection>();
@@ -429,7 +429,7 @@ namespace System.Net.Http
 
                     if (_kind == HttpConnectionKind.Http)
                     {
-                        http2Connection = new Http2Connection(this, stream);
+                        http2Connection = new Http2Connection(this, stream, null, 0);
                         await http2Connection.SetupAsync().ConfigureAwait(false);
 
                         Debug.Assert(_http2Connection == null);
@@ -453,7 +453,7 @@ namespace System.Net.Http
                             throw new HttpRequestException(SR.Format(SR.net_ssl_http2_requires_tls12, sslStream.SslProtocol));
                         }
 
-                        http2Connection = new Http2Connection(this, sslStream);
+                        http2Connection = new Http2Connection(this, sslStream, null, 0);
                         await http2Connection.SetupAsync().ConfigureAwait(false);
 
                         Debug.Assert(_http2Connection == null);
@@ -552,10 +552,10 @@ namespace System.Net.Http
 
                     if (response.Headers.TryGetValues(KnownHeaders.AltSvc.Name, out IEnumerable<string> altSvcValues))
                     {
-                        lock (SyncObj)
-                        {
-                            _altSvcHost = 
-                        }
+                        //lock (SyncObj)
+                        //{
+                        //    _altSvcHost =
+                        //}
                     }
 
                     return response;
@@ -696,8 +696,8 @@ namespace System.Net.Http
         private HttpConnection ConstructHttp11Connection(Socket socket, Stream stream, TransportContext transportContext)
         {
             return _maxConnections == int.MaxValue ?
-                new HttpConnection(this, socket, stream, transportContext) :
-                new HttpConnectionWithFinalizer(this, socket, stream, transportContext); // finalizer needed to signal the pool when a connection is dropped
+                new HttpConnection(this, socket, stream, transportContext, null) :
+                new HttpConnectionWithFinalizer(this, socket, stream, transportContext, null); // finalizer needed to signal the pool when a connection is dropped
         }
 
         // Returns the established stream or an HttpResponseMessage from the proxy indicating failure.
