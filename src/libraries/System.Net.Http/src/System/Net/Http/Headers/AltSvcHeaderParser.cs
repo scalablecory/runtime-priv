@@ -55,7 +55,7 @@ namespace System.Net.Http.Headers
                     return 0;
                 }
 
-                parsedValue = AlternateService.Clear;
+                parsedValue = AltSvcHeaderValue.Clear;
                 return idx - startIndex;
             }
 
@@ -141,9 +141,9 @@ namespace System.Net.Http.Headers
             }
 
             // If no "ma" parameter present, use the default.
-            var maxAgeTimeSpan = new TimeSpan(maxAge * TimeSpan.TicksPerSecond ?? DefaultMaxAgeTicks);
+            var maxAgeTimeSpan = TimeSpan.FromTicks(maxAge * TimeSpan.TicksPerSecond ?? DefaultMaxAgeTicks);
 
-            parsedValue = new AlternateService(alpnProtocolName, altAuthorityHost, altAuthorityPort, maxAgeTimeSpan);
+            parsedValue = new AltSvcHeaderValue(alpnProtocolName, altAuthorityHost, altAuthorityPort, maxAgeTimeSpan);
             return idx - startIndex;
         }
 

@@ -1,23 +1,34 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Net.Http.Headers;
-using System.Text;
-using System.Threading.Tasks;
+﻿// Licensed to the .NET Foundation under one or more agreements.
+// The .NET Foundation licenses this file to you under the MIT license.
+// See the LICENSE file in the project root for more information.
 
 namespace System.Net.Http.Headers
 {
-    internal sealed class AltSvcHeaderValue
+    public sealed class AltSvcHeaderValue
     {
-        /// <summary>
-        /// If true, Alt-Svc should be cleared for this authority: the client should use the original.
-        /// </summary>
-        public bool Clear { get; }
-        public ICollection<AlternateService> Alternatives = new ObjectCollection<AlternateService>();
+        public static AltSvcHeaderValue Clear { get; } = new AltSvcHeaderValue("clear", null, 0, TimeSpan.Zero);
 
-        public AltSvcHeaderValue(bool clear)
+        public string AlpnProtocolName { get; }
+
+        /// <summary>
+        /// The name of the host serving this alternate service.
+        /// If null, the alternate service is on the same host this header was received from.
+        /// </summary>
+        public string Host { get; }
+        public int Port { get; }
+
+        /// <summary>
+        /// The time span this alternate service is valid for.
+        /// If not specified by the header, defaults to 24 hours.
+        /// </summary>
+        public TimeSpan MaxAge { get; }
+
+        public AltSvcHeaderValue(string alpnProtocolName, string host, int port, TimeSpan maxAge)
         {
-            Clear = clear;
+            AlpnProtocolName = alpnProtocolName;
+            Host = host;
+            Port = port;
+            MaxAge = maxAge;
         }
     }
 }

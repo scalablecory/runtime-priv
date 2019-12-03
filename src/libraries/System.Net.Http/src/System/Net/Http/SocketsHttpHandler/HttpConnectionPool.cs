@@ -28,24 +28,22 @@ namespace System.Net.Http
         private readonly string _host;
         private readonly int _port;
         private readonly Uri _proxyUri;
+        private readonly bool _http2Enabled;
         internal readonly byte[] _encodedAuthorityHostHeader;
 
-        //private string _altSvcHost;
-        //private int _altSvcPort;
-        //private long _altSvcExpireTicks;
-        //private byte[] _encodedAltUsedHeader;
-        //private Http2Connection _altSvcHttp2Connection;
-        //private bool _altSvcHttp2ConnectionInProgress;
-        //private readonly List<CachedConnection> _altSvcIdleConnections = new List<CachedConnection>();
-
-        /// <summary>List of idle connections stored in the pool.</summary>
-        private readonly List<CachedConnection> _idleConnections = new List<CachedConnection>();
         /// <summary>The maximum number of connections allowed to be associated with the pool.</summary>
         private readonly int _maxConnections;
 
-        private bool _http2Enabled;
-        private Http2Connection _http2Connection;
-        private SemaphoreSlim _http2ConnectionCreateLock;
+        /// <summary>
+        /// The current authority being used to satisfy requests.
+        /// </summary>
+        private ServiceAuthority _currentAuthority;
+
+        /// <summary>
+        /// The next authority being established.
+        /// Once all connections have migrated to this authority, it is moved to <see cref="_currentAuthority"/>.
+        /// </summary>
+        private ServiceAuthority _nextAuthority;
 
         /// <summary>For non-proxy connection pools, this is the host name in bytes; for proxies, null.</summary>
         private readonly byte[] _hostHeaderValueBytes;
@@ -56,7 +54,7 @@ namespace System.Net.Http
         /// <summary>Queue of waiters waiting for a connection.  Created on demand.</summary>
         private Queue<TaskCompletionSourceWithCancellation<HttpConnection>> _waiters;
 
-        /// <summary>The number of connections associated with the pool.  Some of these may be in <see cref="_idleConnections"/>, others may be in use.</summary>
+        /// <summary>The number of connections associated with the pool.  Some of these may be in <see cref="ServiceAuthority.IdleConnections"/>, others may be in use.</summary>
         private int _associatedConnectionCount;
         /// <summary>Whether the pool has been used since the last time a cleanup occurred.</summary>
         private bool _usedSinceLastCleanup = true;
@@ -65,6 +63,31 @@ namespace System.Net.Http
 
         private const int DefaultHttpPort = 80;
         private const int DefaultHttpsPort = 443;
+
+        private sealed class ServiceAuthority
+        {
+            public string AltSvcProtocolName;
+            public string AltSvcHost;
+            public int AltSvcPort;
+            public long AltSvcExpireTicks;
+
+            public readonly List<CachedConnection> IdleConnections = new List<CachedConnection>();
+
+            public bool Http2Enabled;
+            public Http2Connection Http2Connection;
+            public SemaphoreSlim Http2ConnectionCreateLock;
+
+            public ServiceAuthorityStatus Status;
+        }
+
+        private enum ServiceAuthorityStatus
+        {
+            Opening,
+            Open,
+            Closing,
+            Closed,
+            Defunct
+        }
 
         /// <summary>Initializes the pool.</summary>
         /// <param name="maxConnections">The maximum number of connections allowed to be associated with the pool at any given time.</param>
@@ -552,10 +575,7 @@ namespace System.Net.Http
 
                     if (response.Headers.TryGetValues(KnownHeaders.AltSvc.Name, out IEnumerable<string> altSvcValues))
                     {
-                        //lock (SyncObj)
-                        //{
-                        //    _altSvcHost =
-                        //}
+                        HandleAltSvcHeader(altSvcValues);
                     }
 
                     return response;
@@ -570,6 +590,68 @@ namespace System.Net.Http
                     // Eat exception and try again.
                 }
             }
+        }
+
+        private void HandleAltSvcHeader(IEnumerable<string> altSvcValues)
+        {
+            AltSvcHeaderValue value = FindAppropriateAltSvc(altSvcValues);
+
+            if (value == null)
+            {
+                return;
+            }
+
+            if (value == AltSvcHeaderValue.Clear)
+            {
+                // TODO: mark current alternate as expired. start connecting back to origin.
+            }
+
+            // TODO: start connecting to this service.
+        }
+
+        /// <summary>
+        /// Finds an alternate service to use for the pool's requests.
+        /// </summary>
+        /// <remarks>
+        /// Per RFC, alternate services must be given in the priority the origin would like the client to try.
+        /// This looks over the list and returns the first eligible entry.
+        /// </remarks>
+        private AltSvcHeaderValue FindAppropriateAltSvc(IEnumerable<string> altSvcValues)
+        {
+            AltSvcHeaderValue keptValue = null;
+
+            foreach (string altSvcValue in altSvcValues)
+            {
+                int parseIdx = 0;
+                while (AltSvcHeaderParser.Parser.TryParseValue(altSvcValue, null, ref parseIdx, out object parsedValue))
+                {
+                    var value = (AltSvcHeaderValue)parsedValue;
+
+                    switch (value.AlpnProtocolName)
+                    {
+                        case "clear":
+                            // 'clear' indicates we should clear our alternate service cache,
+                            // and start using the stop using any current Alt-Svc.
+                            // It *should* be the only value here, but the RFC recommends
+                            // leniency -- any other values in the response should be ignored.
+                            return value;
+                        case "h2":
+                            if (_kind == HttpConnectionKind.Http)
+                            {
+                                // Don't change from plaintext to secure.
+                                break;
+                            }
+
+                            keptValue ??= value;
+                            break;
+                        case "http/1.1":
+                            keptValue ??= value;
+                            break;
+                    }
+                }
+            }
+
+            return keptValue;
         }
 
         public async Task<HttpResponseMessage> SendWithNtConnectionAuthAsync(HttpConnection connection, HttpRequestMessage request, bool doRequestAuth, CancellationToken cancellationToken)

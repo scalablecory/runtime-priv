@@ -110,11 +110,11 @@
     <Compile Include="..\..\src\System\Net\Http\FormUrlEncodedContent.cs">
       <Link>ProductionCode\System\Net\Http\FormUrlEncodedContent.cs</Link>
     </Compile>
-    <Compile Include="..\..\src\System\Net\Http\Headers\AlternateService.cs">
-      <Link>ProductionCode\System\Net\Http\Headers\AlternateService.cs</Link>
-    </Compile>
     <Compile Include="..\..\src\System\Net\Http\Headers\AltSvcHeaderParser.cs">
       <Link>ProductionCode\System\Net\Http\Headers\AltSvcHeaderParser.cs</Link>
+    </Compile>
+    <Compile Include="..\..\src\System\Net\Http\Headers\AltSvcHeaderValue.cs">
+      <Link>ProductionCode\System\Net\Http\Headers\AltSvcHeaderValue.cs</Link>
     </Compile>
     <Compile Include="..\..\src\System\Net\Http\Headers\AuthenticationHeaderValue.cs">
       <Link>ProductionCode\System\Net\Http\Headers\AuthenticationHeaderValue.cs</Link>
