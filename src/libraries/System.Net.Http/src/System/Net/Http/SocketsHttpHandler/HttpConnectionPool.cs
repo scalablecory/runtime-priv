@@ -66,10 +66,14 @@ namespace System.Net.Http
 
         private sealed class ServiceAuthority
         {
-            public string AltSvcProtocolName;
-            public string AltSvcHost;
-            public int AltSvcPort;
-            public long AltSvcExpireTicks;
+            public ServiceAuthority NextAuthority;
+
+            public readonly string AltSvcAlpnProtocolName;
+            public readonly string Host;
+            public readonly int Port;
+            public long ExpireTicks;
+
+            public bool IsOrigin => AltSvcAlpnProtocolName == null;
 
             public readonly List<CachedConnection> IdleConnections = new List<CachedConnection>();
 
@@ -78,6 +82,14 @@ namespace System.Net.Http
             public SemaphoreSlim Http2ConnectionCreateLock;
 
             public ServiceAuthorityStatus Status;
+
+            public ServiceAuthority(string alpnProtocolName, string host, int port, long expireTicks)
+            {
+                AltSvcAlpnProtocolName = alpnProtocolName;
+                Host = host;
+                Port = port;
+                ExpireTicks = expireTicks;
+            }
         }
 
         private enum ServiceAuthorityStatus
@@ -547,6 +559,8 @@ namespace System.Net.Http
 
         public async Task<HttpResponseMessage> SendWithRetryAsync(HttpRequestMessage request, bool doRequestAuth, CancellationToken cancellationToken)
         {
+            bool waitForNextAuthority = false;
+
             while (true)
             {
                 // Loop on connection failures and retry if possible.
@@ -573,9 +587,25 @@ namespace System.Net.Http
                         response = await connection.SendAsync(request, cancellationToken).ConfigureAwait(false);
                     }
 
+                    if (response.StatusCode == HttpStatusCode.MisdirectedRequest)
+                    {
+                        // 421 Misdirected Request, if given to us by an Alt-Svc, indicates the current Alt-Svc can not service the request.
+                        // In this case, start a transition back to the origin and retry the request.
+                        lock (SyncObj)
+                        {
+                            if ((_nextAuthority ?? _currentAuthority).IsOrigin == false)
+                            {
+                                response.Dispose();
+                                StartAuthorityTransition(null, _host, _port, long.MaxValue);
+                                waitForNextAuthority = true;
+                                continue;
+                            }
+                        }
+                    }
+
                     if (response.Headers.TryGetValues(KnownHeaders.AltSvc.Name, out IEnumerable<string> altSvcValues))
                     {
-                        HandleAltSvcHeader(altSvcValues);
+                        HandleAltSvcHeader(altSvcValues, response);
                     }
 
                     return response;
@@ -592,7 +622,7 @@ namespace System.Net.Http
             }
         }
 
-        private void HandleAltSvcHeader(IEnumerable<string> altSvcValues)
+        private void HandleAltSvcHeader(IEnumerable<string> altSvcValues, HttpResponseMessage responseMessage)
         {
             AltSvcHeaderValue value = FindAppropriateAltSvc(altSvcValues);
 
@@ -601,12 +631,81 @@ namespace System.Net.Http
                 return;
             }
 
-            if (value == AltSvcHeaderValue.Clear)
+            lock (SyncObj)
             {
-                // TODO: mark current alternate as expired. start connecting back to origin.
-            }
+                ServiceAuthority current = _nextAuthority ?? _currentAuthority;
 
-            // TODO: start connecting to this service.
+                string nextAlpnProtocolName, nextHost;
+                int nextPort;
+                long expireTicks;
+
+                if (value == AltSvcHeaderValue.Clear)
+                {
+                    // Expire current Alt-Svc if we have one -- start transitioning back to origin.
+
+                    if (current.IsOrigin)
+                    {
+                        return;
+                    }
+
+                    nextAlpnProtocolName = null;
+                    nextHost = _host;
+                    nextPort = _port;
+                    expireTicks = long.MaxValue;
+                }
+                else
+                {
+                    long lifetimeTicks = (value.MaxAge.Ticks - (responseMessage.Headers.Age?.Ticks ?? 0)) / TimeSpan.TicksPerMillisecond;
+
+                    if (current.AltSvcAlpnProtocolName != value.AlpnProtocolName || current.Host != value.Host || current.Port != value.Port)
+                    {
+                        // New authority -- start transitioning.
+                        // This will trigger if we get an Alt-Svc for the origin... servers really shouldn't do this but it won't hurt beyond a little extra resource usage.
+
+                        // Don't bother transitioning if the lifetime is less than 1 minute...
+                        if (lifetimeTicks < 60_000)
+                        {
+                            return;
+                        }
+
+                        nextAlpnProtocolName = value.AlpnProtocolName;
+                        nextHost = value.Host;
+                        nextPort = value.Port;
+                        expireTicks = Environment.TickCount64 + lifetimeTicks;
+                    }
+                    else
+                    {
+                        // Same authority, but extending Max Age.
+                        // This will happen if we are already transitioning and the old authority keeps pumping Alt-Svc headers at us.
+                        // This can also happen if our current authority wants to extend its own lifetime.
+
+                        expireTicks = Environment.TickCount64 + lifetimeTicks;
+
+                        // Servers should send 'clear' if they want to expire old Alt-Svc headers.
+                        // So, we can ignore them if they give us a wonky value.
+                        if (expireTicks > current.ExpireTicks)
+                        {
+                            current.ExpireTicks = expireTicks;
+                        }
+
+                        return;
+                    }
+                }
+
+                StartAuthorityTransition(nextAlpnProtocolName, nextHost, nextPort, expireTicks);
+            }
+        }
+
+        private void StartAuthorityTransition(string alpnProtocolName, string host, int port, long expireTicks)
+        {
+            Debug.Assert(Monitor.IsEntered(SyncObj));
+
+            ServiceAuthority authority = new ServiceAuthority(alpnProtocolName, host, port, expireTicks);
+
+            (_nextAuthority ?? _currentAuthority).NextAuthority = authority;
+            _nextAuthority = authority;
+
+            // The connect() will start upon the next request to use this origin.
         }
 
         /// <summary>
