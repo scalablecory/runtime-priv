@@ -19,14 +19,14 @@ using System.Threading.Tasks;
 namespace System.Net.Http
 {
     /// <summary>Provides a pool of connections to the same endpoint.</summary>
-    internal sealed class HttpConnectionPool : IDisposable
+    internal sealed partial class HttpConnectionPool : IDisposable
     {
         private static readonly bool s_isWindows7Or2008R2 = GetIsWindows7Or2008R2();
 
         private readonly HttpConnectionPoolManager _poolManager;
         private readonly HttpConnectionKind _kind;
-        private readonly string _host;
-        private readonly int _port;
+        private readonly string _originHost;
+        private readonly int _originPort;
         private readonly Uri _proxyUri;
         private readonly bool _http2Enabled;
         internal readonly byte[] _encodedAuthorityHostHeader;
@@ -34,16 +34,24 @@ namespace System.Net.Http
         /// <summary>The maximum number of connections allowed to be associated with the pool.</summary>
         private readonly int _maxConnections;
 
-        /// <summary>
-        /// The current authority being used to satisfy requests.
-        /// </summary>
-        private ServiceAuthority _currentAuthority;
+        /// <summary>The current authority handling requests for this origin.</summary>
+        private ServiceAuthority _authority;
+
+        /// <summary>A dictionary of blacklisted Alt-Svc authorities which have failed to process requests. Created on demand.</summary>
+        private HashSet<(string alpnProtocolName, string host, int port)> _unreliableAuthorities;
+        private const int UnreliableAuthorityBlacklistTimeInMilliseconds = 1000 * 60 * 10; // 10 minutes.
+
+        /// <summary>A cancellation token source used to clean up timers that remove authorities from the <see cref="_unreliableAuthorities"/> set. Created on demand.</summary>
+        private CancellationTokenSource _authorityTimerCancellationTokenSource;
+
+        /// <summary>If true, support the Alt-Svc header.</summary>
+        private bool _altSvcEnabled = false;
 
         /// <summary>
-        /// The next authority being established.
-        /// Once all connections have migrated to this authority, it is moved to <see cref="_currentAuthority"/>.
+        /// If our <see cref="_unreliableAuthorities"/> set grows above <see cref="MaxUnreliableAuthoritiesBeforeDisablingAltSvc"/>,
+        /// Alt-Svc is disabled to avoid a buggy server growing our dictionary indefinitely.
         /// </summary>
-        private ServiceAuthority _nextAuthority;
+        private const int MaxUnreliableAuthoritiesBeforeDisablingAltSvc = 8;
 
         /// <summary>For non-proxy connection pools, this is the host name in bytes; for proxies, null.</summary>
         private readonly byte[] _hostHeaderValueBytes;
@@ -64,53 +72,19 @@ namespace System.Net.Http
         private const int DefaultHttpPort = 80;
         private const int DefaultHttpsPort = 443;
 
-        private sealed class ServiceAuthority
-        {
-            public ServiceAuthority NextAuthority;
-
-            public readonly string AltSvcAlpnProtocolName;
-            public readonly string Host;
-            public readonly int Port;
-            public long ExpireTicks;
-
-            public bool IsOrigin => AltSvcAlpnProtocolName == null;
-
-            public readonly List<CachedConnection> IdleConnections = new List<CachedConnection>();
-
-            public bool Http2Enabled;
-            public Http2Connection Http2Connection;
-            public SemaphoreSlim Http2ConnectionCreateLock;
-
-            public ServiceAuthorityStatus Status;
-
-            public ServiceAuthority(string alpnProtocolName, string host, int port, long expireTicks)
-            {
-                AltSvcAlpnProtocolName = alpnProtocolName;
-                Host = host;
-                Port = port;
-                ExpireTicks = expireTicks;
-            }
-        }
-
-        private enum ServiceAuthorityStatus
-        {
-            Opening,
-            Open,
-            Closing,
-            Closed,
-            Defunct
-        }
-
         /// <summary>Initializes the pool.</summary>
         /// <param name="maxConnections">The maximum number of connections allowed to be associated with the pool at any given time.</param>
         public HttpConnectionPool(HttpConnectionPoolManager poolManager, HttpConnectionKind kind, string host, int port, string sslHostName, Uri proxyUri, int maxConnections)
         {
             _poolManager = poolManager;
             _kind = kind;
-            _host = host;
-            _port = port;
+            _originHost = host;
+            _originPort = port;
             _proxyUri = proxyUri;
             _maxConnections = maxConnections;
+
+            // Default authority to origin.
+            _authority = new ServiceAuthority(null, host, port, long.MaxValue);
 
             _http2Enabled = (_poolManager.Settings._maxHttpVersion == HttpVersion.Version20);
 
@@ -122,6 +96,7 @@ namespace System.Net.Http
                     Debug.Assert(sslHostName == null);
                     Debug.Assert(proxyUri == null);
                     _http2Enabled = _poolManager.Settings._allowUnencryptedHttp2;
+                    _altSvcEnabled = true;
                     break;
 
                 case HttpConnectionKind.Https:
@@ -129,6 +104,7 @@ namespace System.Net.Http
                     Debug.Assert(port != 0);
                     Debug.Assert(sslHostName != null);
                     Debug.Assert(proxyUri == null);
+                    _altSvcEnabled = true;
                     break;
 
                 case HttpConnectionKind.Proxy:
@@ -171,14 +147,14 @@ namespace System.Net.Http
             }
 
             string hostHeader = null;
-            if (_host != null)
+            if (_originHost != null)
             {
                 // Precalculate ASCII bytes for Host header
                 // Note that if _host is null, this is a (non-tunneled) proxy connection, and we can't cache the hostname.
                 hostHeader =
-                    (_port != (sslHostName == null ? DefaultHttpPort : DefaultHttpsPort)) ?
-                    $"{_host}:{_port}" :
-                    _host;
+                    (_originPort != (sslHostName == null ? DefaultHttpPort : DefaultHttpsPort)) ?
+                    $"{_originHost}:{_originPort}" :
+                    _originHost;
 
                 // Note the IDN hostname should always be ASCII, since it's already been IDNA encoded.
                 _hostHeaderValueBytes = Encoding.ASCII.GetBytes(hostHeader);
@@ -287,7 +263,6 @@ namespace System.Net.Http
 
             TimeSpan pooledConnectionLifetime = _poolManager.Settings._pooledConnectionLifetime;
             long nowTicks = Environment.TickCount64;
-            List<CachedConnection> list = _idleConnections;
 
             // Try to find a usable cached connection.
             // If we can't find one, we will either wait for one to become available (if at the connection limit)
@@ -298,41 +273,48 @@ namespace System.Net.Http
                 CachedConnection cachedConnection;
                 lock (SyncObj)
                 {
-                    if (list.Count > 0)
+                    ServiceAuthority authority = _authority;
+                    if (authority.TryGetIdleConnection(out cachedConnection))
                     {
                         // We have a cached connection that we can attempt to use.
                         // Test it below outside the lock, to avoid doing expensive validation while holding the lock.
-                        cachedConnection = list[list.Count - 1];
-                        list.RemoveAt(list.Count - 1);
                     }
                     else
                     {
-                        // No valid cached connections.
-                        if (_associatedConnectionCount < _maxConnections)
+                        authority = _authority.PreviousAuthority;
+                        if (authority.TryGetIdleConnection(out cachedConnection))
                         {
-                            // We are under the connection limit, so just increment the count and return null
-                            // to indicate to the caller that they should create a new connection.
-                            IncrementConnectionCountNoLock();
-                            return new ValueTask<HttpConnection>((HttpConnection)null);
+                            // The current authority has no idle connections. Use the previous authority to avoid waiting.
                         }
                         else
                         {
-                            // We've reached the connection limit and need to wait for an existing connection
-                            // to become available, or to be closed so that we can create a new connection.
-                            // Enqueue a waiter that will be signalled when this happens.
-                            // Break out of the loop and then do the actual wait below.
-                            waiter = EnqueueWaiter();
-                            break;
-                        }
+                            // No valid cached connections.
+                            if (_associatedConnectionCount < _maxConnections)
+                            {
+                                // We are under the connection limit, so just increment the count and return null
+                                // to indicate to the caller that they should create a new connection.
+                                IncrementConnectionCountNoLock();
+                                return new ValueTask<HttpConnection>((HttpConnection)null);
+                            }
+                            else
+                            {
+                                // We've reached the connection limit and need to wait for an existing connection
+                                // to become available, or to be closed so that we can create a new connection.
+                                // Enqueue a waiter that will be signalled when this happens.
+                                // Break out of the loop and then do the actual wait below.
+                                waiter = EnqueueWaiter();
+                                break;
+                            }
 
-                        // Note that we don't check for _disposed.  We may end up disposing the
-                        // created connection when it's returned, but we don't want to block use
-                        // of the pool if it's already been disposed, as there's a race condition
-                        // between getting a pool and someone disposing of it, and we don't want
-                        // to complicate the logic about trying to get a different pool when the
-                        // retrieved one has been disposed of.  In the future we could alternatively
-                        // try returning such connections to whatever pool is currently considered
-                        // current for that endpoint, if there is one.
+                            // Note that we don't check for _disposed.  We may end up disposing the
+                            // created connection when it's returned, but we don't want to block use
+                            // of the pool if it's already been disposed, as there's a race condition
+                            // between getting a pool and someone disposing of it, and we don't want
+                            // to complicate the logic about trying to get a different pool when the
+                            // retrieved one has been disposed of.  In the future we could alternatively
+                            // try returning such connections to whatever pool is currently considered
+                            // current for that endpoint, if there is one.
+                        }
                     }
                 }
 
@@ -589,23 +571,52 @@ namespace System.Net.Http
 
                     if (response.StatusCode == HttpStatusCode.MisdirectedRequest)
                     {
-                        // 421 Misdirected Request, if given to us by an Alt-Svc, indicates the current Alt-Svc can not service the request.
-                        // In this case, start a transition back to the origin and retry the request.
-                        lock (SyncObj)
+                        // 421 Misdirected Request, if given to us by an Alt-Svc, indicates the current Alt-Svc can
+                        // not service the request. In this case, we are guaranteed that the request has not been
+                        // processed and can retry the request at the origin without worrying about idempotency.
+
+                        ServiceAuthority authority = (ServiceAuthority)connection.ServiceAuthority;
+
+                        if (!authority.IsOrigin)
                         {
-                            if ((_nextAuthority ?? _currentAuthority).IsOrigin == false)
+                            response.Dispose();
+                            lock (SyncObj)
                             {
-                                response.Dispose();
-                                StartAuthorityTransition(null, _host, _port, long.MaxValue);
-                                waitForNextAuthority = true;
-                                continue;
+                                _unreliableAuthorities ??= new HashSet<(string alpnProtocolName, string host, int port)>();
+
+                                if (_unreliableAuthorities.Count == MaxUnreliableAuthoritiesBeforeDisablingAltSvc)
+                                {
+                                    _altSvcEnabled = false;
+                                }
+                                else
+                                {
+                                    _unreliableAuthorities.Add((authority.AltSvcAlpnProtocolName, authority.Host, authority.Port));
+
+                                    _authorityTimerCancellationTokenSource ??= new CancellationTokenSource();
+                                    _ = Task.Delay(UnreliableAuthorityBlacklistTimeInMilliseconds, _authorityTimerCancellationTokenSource.Token).ContinueWith(_ =>
+                                    {
+                                        lock (SyncObj)
+                                        {
+                                            _unreliableAuthorities.Remove((authority.AltSvcAlpnProtocolName, authority.Host, authority.Port));
+                                        }
+                                    }, TaskScheduler.Default);
+                                }
+
+                                StartAuthorityTransition(null, _originHost, _originPort, long.MaxValue);
                             }
+
+                            waitForNextAuthority = true;
+                            continue;
                         }
                     }
 
-                    if (response.Headers.TryGetValues(KnownHeaders.AltSvc.Name, out IEnumerable<string> altSvcValues))
+                    if (_altSvcEnabled)
                     {
-                        HandleAltSvcHeader(altSvcValues, response);
+                        if (response.Headers.TryGetValues(KnownHeaders.AltSvc.Name, out IEnumerable<string> altSvcValues))
+                        {
+                            HandleAltSvcHeader(altSvcValues, response);
+                        }
+                        //TODO: check for an ALTSVC frame for HTTP/2.
                     }
 
                     return response;
@@ -622,6 +633,9 @@ namespace System.Net.Http
             }
         }
 
+        /// <summary>
+        /// Reads the Alt-Svc header and possibly starts an authority transition.
+        /// </summary>
         private void HandleAltSvcHeader(IEnumerable<string> altSvcValues, HttpResponseMessage responseMessage)
         {
             AltSvcHeaderValue value = FindAppropriateAltSvc(altSvcValues);
@@ -633,11 +647,7 @@ namespace System.Net.Http
 
             lock (SyncObj)
             {
-                ServiceAuthority current = _nextAuthority ?? _currentAuthority;
-
-                string nextAlpnProtocolName, nextHost;
-                int nextPort;
-                long expireTicks;
+                ServiceAuthority current = _authority;
 
                 if (value == AltSvcHeaderValue.Clear)
                 {
@@ -648,62 +658,54 @@ namespace System.Net.Http
                         return;
                     }
 
-                    nextAlpnProtocolName = null;
-                    nextHost = _host;
-                    nextPort = _port;
-                    expireTicks = long.MaxValue;
+                    StartAuthorityTransition(null, _originHost, _originPort, long.MaxValue);
+                    return;
                 }
-                else
+
+                long lifetimeTicks = (value.MaxAge.Ticks - (responseMessage.Headers.Age?.Ticks ?? 0)) / TimeSpan.TicksPerMillisecond;
+
+                if (current.AltSvcAlpnProtocolName != value.AlpnProtocolName || current.Host != value.Host || current.Port != value.Port)
                 {
-                    long lifetimeTicks = (value.MaxAge.Ticks - (responseMessage.Headers.Age?.Ticks ?? 0)) / TimeSpan.TicksPerMillisecond;
+                    // New authority -- start transitioning.
+                    // This will trigger if we get an Alt-Svc for the origin... servers really shouldn't do this but it won't hurt beyond a little extra resource usage.
 
-                    if (current.AltSvcAlpnProtocolName != value.AlpnProtocolName || current.Host != value.Host || current.Port != value.Port)
+                    if (lifetimeTicks < 60_000)
                     {
-                        // New authority -- start transitioning.
-                        // This will trigger if we get an Alt-Svc for the origin... servers really shouldn't do this but it won't hurt beyond a little extra resource usage.
-
                         // Don't bother transitioning if the lifetime is less than 1 minute...
-                        if (lifetimeTicks < 60_000)
-                        {
-                            return;
-                        }
-
-                        nextAlpnProtocolName = value.AlpnProtocolName;
-                        nextHost = value.Host;
-                        nextPort = value.Port;
-                        expireTicks = Environment.TickCount64 + lifetimeTicks;
-                    }
-                    else
-                    {
-                        // Same authority, but extending Max Age.
-                        // This will happen if we are already transitioning and the old authority keeps pumping Alt-Svc headers at us.
-                        // This can also happen if our current authority wants to extend its own lifetime.
-
-                        expireTicks = Environment.TickCount64 + lifetimeTicks;
-
-                        // Servers should send 'clear' if they want to expire old Alt-Svc headers.
-                        // So, we can ignore them if they give us a wonky value.
-                        if (expireTicks > current.ExpireTicks)
-                        {
-                            current.ExpireTicks = expireTicks;
-                        }
-
                         return;
                     }
+
+                    StartAuthorityTransition(value.AlpnProtocolName, value.Host, value.Port, Environment.TickCount64 + lifetimeTicks);
+                    return;
                 }
 
-                StartAuthorityTransition(nextAlpnProtocolName, nextHost, nextPort, expireTicks);
+                // Same authority, but extending Max Age.
+                // This will happen if we are already transitioning and the old authority keeps pumping Alt-Svc headers at us.
+                // TODO: this may also happen if our current authority wants to extend its own lifetime -- RFC not clear.
+                long expireTicks = Environment.TickCount64 + lifetimeTicks;
+
+                // TODO: I don't think Alt-Svc should be used as a way to reduce a previously sent Max Age.
+                // It is safe to ignore this header, as it's expected that 'clear' would be used to invalidate all previously received alternates.
+                if (expireTicks > current.ExpireTicks)
+                {
+                    current.ExpireTicks = expireTicks;
+                }
             }
         }
 
+        /// <summary>
+        /// Sets up a transition to a new authority. Does not actually start connecting.
+        /// </summary>
         private void StartAuthorityTransition(string alpnProtocolName, string host, int port, long expireTicks)
         {
             Debug.Assert(Monitor.IsEntered(SyncObj));
 
-            ServiceAuthority authority = new ServiceAuthority(alpnProtocolName, host, port, expireTicks);
+            ServiceAuthority current = _authority;
+            ServiceAuthority next = new ServiceAuthority(alpnProtocolName, host, port, expireTicks);
 
-            (_nextAuthority ?? _currentAuthority).NextAuthority = authority;
-            _nextAuthority = authority;
+            next.PreviousAuthority = current;
+            current.NextAuthority = next;
+            _authority = next;
 
             // The connect() will start upon the next request to use this origin.
         }
@@ -803,7 +805,7 @@ namespace System.Net.Http
             return SendWithProxyAuthAsync(request, doRequestAuth, cancellationToken);
         }
 
-        private async ValueTask<(Socket, Stream, TransportContext, HttpResponseMessage)> ConnectAsync(HttpRequestMessage request, bool allowHttp2, CancellationToken cancellationToken)
+        private async ValueTask<(ServiceAuthority, Socket, Stream, TransportContext, HttpResponseMessage)> ConnectAsync(HttpRequestMessage request, bool allowHttp2, CancellationToken cancellationToken)
         {
             // If a non-infinite connect timeout has been set, create and use a new CancellationToken that'll be canceled
             // when either the original token is canceled or a connect timeout occurs.
@@ -815,6 +817,8 @@ namespace System.Net.Http
                 cancellationToken = cancellationWithConnectTimeout.Token;
             }
 
+            ServiceAuthority authority = null;
+
             try
             {
                 Stream stream = null;
@@ -823,7 +827,12 @@ namespace System.Net.Http
                     case HttpConnectionKind.Http:
                     case HttpConnectionKind.Https:
                     case HttpConnectionKind.ProxyConnect:
-                        stream = await ConnectHelper.ConnectAsync(_host, _port, cancellationToken).ConfigureAwait(false);
+                        lock (SyncObj)
+                        {
+                            authority = _authority;
+                            authority.ReserveConnection();
+                        }
+                        stream = await ConnectHelper.ConnectAsync(authority.Host, authority.Port, cancellationToken).ConfigureAwait(false);
                         break;
 
                     case HttpConnectionKind.Proxy:
@@ -838,7 +847,7 @@ namespace System.Net.Http
                         {
                             // Return non-success response from proxy.
                             response.RequestMessage = request;
-                            return (null, null, null, response);
+                            return (null, null, null, null, response);
                         }
                         break;
                 }
@@ -853,7 +862,18 @@ namespace System.Net.Http
                     transportContext = sslStream.TransportContext;
                 }
 
-                return (socket, stream, transportContext, null);
+                return (authority, socket, stream, transportContext, null);
+            }
+            catch
+            {
+                if (authority != null)
+                {
+                    lock (SyncObj)
+                    {
+                        authority.RemoveReservation();
+                    }
+                }
+                throw;
             }
             finally
             {
@@ -863,7 +883,7 @@ namespace System.Net.Http
 
         internal async ValueTask<(HttpConnection, HttpResponseMessage)> CreateHttp11ConnectionAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
-            (Socket socket, Stream stream, TransportContext transportContext, HttpResponseMessage failureResponse) =
+            (ServiceAuthority authority, Socket socket, Stream stream, TransportContext transportContext, HttpResponseMessage failureResponse) =
                 await ConnectAsync(request, false, cancellationToken).ConfigureAwait(false);
 
             if (failureResponse != null)
@@ -871,14 +891,14 @@ namespace System.Net.Http
                 return (null, failureResponse);
             }
 
-            return (ConstructHttp11Connection(socket, stream, transportContext), null);
+            return (ConstructHttp11Connection(authority, socket, stream, transportContext), null);
         }
 
-        private HttpConnection ConstructHttp11Connection(Socket socket, Stream stream, TransportContext transportContext)
+        private HttpConnection ConstructHttp11Connection(ServiceAuthority authority, Socket socket, Stream stream, TransportContext transportContext)
         {
             return _maxConnections == int.MaxValue ?
-                new HttpConnection(this, socket, stream, transportContext, null) :
-                new HttpConnectionWithFinalizer(this, socket, stream, transportContext, null); // finalizer needed to signal the pool when a connection is dropped
+                new HttpConnection(this, authority, socket, stream, transportContext, null) :
+                new HttpConnectionWithFinalizer(this, authority, socket, stream, transportContext, null); // finalizer needed to signal the pool when a connection is dropped
         }
 
         // Returns the established stream or an HttpResponseMessage from the proxy indicating failure.
@@ -886,7 +906,7 @@ namespace System.Net.Http
         {
             // Send a CONNECT request to the proxy server to establish a tunnel.
             HttpRequestMessage tunnelRequest = new HttpRequestMessage(HttpMethod.Connect, _proxyUri);
-            tunnelRequest.Headers.Host = $"{_host}:{_port}";    // This specifies destination host/port to connect to
+            tunnelRequest.Headers.Host = $"{_originHost}:{_originPort}"; // This specifies destination host/port to connect to
 
             if (headers != null && headers.TryGetValues(HttpKnownHeaderNames.UserAgent, out IEnumerable<string> values))
             {
@@ -908,7 +928,7 @@ namespace System.Net.Http
         {
             Debug.Assert(Monitor.IsEntered(SyncObj));
             Debug.Assert(Settings._maxConnectionsPerServer != int.MaxValue);
-            Debug.Assert(_idleConnections.Count == 0, $"With {_idleConnections.Count} idle connections, we shouldn't have a waiter.");
+            Debug.Assert(CountIdleConnections() == 0, $"With {CountIdleConnections()} idle connections, we shouldn't have a waiter.");
 
             if (_waiters == null)
             {
@@ -933,9 +953,24 @@ namespace System.Net.Http
         {
             Debug.Assert(Monitor.IsEntered(SyncObj));
             Debug.Assert(Settings._maxConnectionsPerServer != int.MaxValue);
-            Debug.Assert(_idleConnections.Count == 0, $"With {_idleConnections.Count} idle connections, we shouldn't have a waiter.");
+            Debug.Assert(CountIdleConnections() == 0, $"With {CountIdleConnections()} idle connections, we shouldn't have a waiter.");
 
             return _waiters.Dequeue();
+        }
+
+        private int CountIdleConnections()
+        {
+            Debug.Assert(Monitor.IsEntered(SyncObj));
+
+            ServiceAuthority authority = _authority;
+            int total = authority.IdleConnectionCount;
+
+            while ((authority = authority.PreviousAuthority) != null)
+            {
+                total += authority.IdleConnectionCount;
+            }
+
+            return total;
         }
 
         private void IncrementConnectionCountNoLock()
@@ -1016,49 +1051,54 @@ namespace System.Net.Http
 
             if (!lifetimeExpired)
             {
-                List<CachedConnection> list = _idleConnections;
+                ServiceAuthority authority = (ServiceAuthority)connection.ServiceAuthority;
                 lock (SyncObj)
                 {
-                    Debug.Assert(list.Count <= _maxConnections, $"Expected {list.Count} <= {_maxConnections}");
+                    Debug.Assert(authority.IdleConnectionCount <= _maxConnections, $"Expected {authority.IdleConnectionCount} <= {_maxConnections}");
 
-                    // Mark the pool as still being active.
-                    _usedSinceLastCleanup = true;
-
-                    // If there's someone waiting for a connection and this one's still valid, simply transfer this one to them rather than pooling it.
-                    // Note that while we checked connection lifetime above, we don't check idle timeout, as even if idle timeout
-                    // is zero, we consider a connection that's just handed from one use to another to never actually be idle.
-                    bool receivedUnexpectedData = false;
-                    if (HasWaiter())
+                    if (authority.IsActive)
                     {
-                        receivedUnexpectedData = connection.EnsureReadAheadAndPollRead();
-                        if (!receivedUnexpectedData && TransferConnection(connection))
+                        // Mark the pool as still being active.
+                        _usedSinceLastCleanup = true;
+
+                        // If there's someone waiting for a connection and this one's still valid, simply transfer this one to them rather than pooling it.
+                        // Note that while we checked connection lifetime above, we don't check idle timeout, as even if idle timeout
+                        // is zero, we consider a connection that's just handed from one use to another to never actually be idle.
+                        bool receivedUnexpectedData = false;
+                        if (HasWaiter())
                         {
-                            if (NetEventSource.IsEnabled) connection.Trace("Transferred connection to waiter.");
-                            return;
+                            receivedUnexpectedData = connection.EnsureReadAheadAndPollRead();
+                            if (!receivedUnexpectedData && TransferConnection(connection))
+                            {
+                                if (NetEventSource.IsEnabled) connection.Trace("Transferred connection to waiter.");
+                                return;
+                            }
                         }
-                    }
 
-                    // If the connection is still valid, add it to the list.
-                    // If the pool has been disposed of, dispose the connection being returned,
-                    // as the pool is being deactivated. We do this after the above in order to
-                    // use pooled connections to satisfy any requests that pended before the
-                    // the pool was disposed of.  We also dispose of connections if connection
-                    // timeouts are such that the connection would immediately expire, anyway, as
-                    // well as for connections that have unexpectedly received extraneous data / EOF.
-                    if (!receivedUnexpectedData &&
-                        !_disposed &&
-                        _poolManager.Settings._pooledConnectionIdleTimeout != TimeSpan.Zero)
-                    {
-                        // Pool the connection by adding it to the list.
-                        list.Add(new CachedConnection(connection));
-                        if (NetEventSource.IsEnabled) connection.Trace("Stored connection in pool.");
-                        return;
+                        // If the connection is still valid, add it to the list.
+                        // If the pool has been disposed of, dispose the connection being returned,
+                        // as the pool is being deactivated. We do this after the above in order to
+                        // use pooled connections to satisfy any requests that pended before the
+                        // the pool was disposed of.  We also dispose of connections if connection
+                        // timeouts are such that the connection would immediately expire, anyway, as
+                        // well as for connections that have unexpectedly received extraneous data / EOF.
+                        if (!receivedUnexpectedData &&
+                            !_disposed &&
+                            _poolManager.Settings._pooledConnectionIdleTimeout != TimeSpan.Zero)
+                        {
+                            // Pool the connection by adding it to the list.
+                            if (authority.TryReturnConnection(connection))
+                            {
+                                if (NetEventSource.IsEnabled) connection.Trace("Stored connection in pool.");
+                                return;
+                            }
+                        }
                     }
                 }
             }
 
             // The connection could be not be reused.  Dispose of it.
-            // Disposing it will alert any waiters that a connection slot has become available.
+            // Disposing it will remove the reservation for this connection and alert any waiters that a connection slot has become available.
             if (NetEventSource.IsEnabled)
             {
                 connection.Trace(
@@ -1087,23 +1127,22 @@ namespace System.Net.Http
         /// </summary>
         public void Dispose()
         {
-            List<CachedConnection> list = _idleConnections;
             lock (SyncObj)
             {
                 if (!_disposed)
                 {
                     if (NetEventSource.IsEnabled) Trace("Disposing pool.");
                     _disposed = true;
-                    list.ForEach(c => c._connection.Dispose());
-                    list.Clear();
 
-                    if (_http2Connection != null)
+                    ServiceAuthority authority = _authority;
+                    do
                     {
-                        _http2Connection.Dispose();
-                        _http2Connection = null;
+                        authority.Dispose();
                     }
+                    while ((authority = authority.PreviousAuthority) != null);
+                    _authority = null;
                 }
-                Debug.Assert(list.Count == 0, $"Expected {nameof(list)}.{nameof(list.Count)} == 0");
+                Debug.Assert(_authority == null);
             }
         }
 

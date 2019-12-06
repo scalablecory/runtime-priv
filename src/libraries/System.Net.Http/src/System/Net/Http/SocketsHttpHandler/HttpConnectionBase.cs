@@ -2,6 +2,7 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 // See the LICENSE file in the project root for more information.
 
+using System.Diagnostics;
 using System.IO;
 using System.Net.Security;
 using System.Runtime.CompilerServices;
@@ -12,6 +13,14 @@ namespace System.Net.Http
 {
     internal abstract class HttpConnectionBase : IHttpTrace
     {
+        public ServiceAuthorityBase ServiceAuthority { get; }
+
+        protected HttpConnectionBase(ServiceAuthorityBase serviceAuthority)
+        {
+            Debug.Assert(serviceAuthority != null);
+            ServiceAuthority = serviceAuthority;
+        }
+
         public abstract Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken);
         public abstract void Trace(string message, [CallerMemberName] string memberName = null);
 
