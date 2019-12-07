@@ -241,20 +241,20 @@ namespace System.Net.Http
         public CredentialCache PreAuthCredentials { get; }
 
         /// <summary>Object used to synchronize access to state in the pool.</summary>
-        private object SyncObj => _idleConnections;
+        private object SyncObj { get; } = new object(); // TODO: some other object we can use?
 
         private ValueTask<(HttpConnectionBase connection, bool isNewConnection, HttpResponseMessage failureResponse)>
-            GetConnectionAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+            GetConnectionAsync(ServiceAuthority authority, HttpRequestMessage request, CancellationToken cancellationToken)
         {
             if (_http2Enabled && request.Version.Major >= 2)
             {
-                return GetHttp2ConnectionAsync(request, cancellationToken);
+                return GetHttp2ConnectionAsync(authority, request, cancellationToken);
             }
 
-            return GetHttpConnectionAsync(request, cancellationToken);
+            return GetHttpConnectionAsync(authority, request, cancellationToken);
         }
 
-        private ValueTask<HttpConnection> GetOrReserveHttp11ConnectionAsync(CancellationToken cancellationToken)
+        private ValueTask<HttpConnection> GetOrReserveHttp11ConnectionAsync(ServiceAuthority desiredAuthority, CancellationToken cancellationToken)
         {
             if (cancellationToken.IsCancellationRequested)
             {
@@ -273,48 +273,44 @@ namespace System.Net.Http
                 CachedConnection cachedConnection;
                 lock (SyncObj)
                 {
-                    ServiceAuthority authority = _authority;
+                    ServiceAuthority authority = desiredAuthority ?? _authority;
                     if (authority.TryGetIdleConnection(out cachedConnection))
                     {
                         // We have a cached connection that we can attempt to use.
                         // Test it below outside the lock, to avoid doing expensive validation while holding the lock.
                     }
+                    else if (authority != desiredAuthority && (authority = authority.PreviousAuthority) != null && authority.TryGetIdleConnection(out cachedConnection))
+                    {
+                        // The current authority has no idle connections. Use the previous authority to avoid waiting.
+                    }
                     else
                     {
-                        authority = _authority.PreviousAuthority;
-                        if (authority.TryGetIdleConnection(out cachedConnection))
+                        // No valid cached connections.
+                        if (_associatedConnectionCount < _maxConnections)
                         {
-                            // The current authority has no idle connections. Use the previous authority to avoid waiting.
+                            // We are under the connection limit, so just increment the count and return null
+                            // to indicate to the caller that they should create a new connection.
+                            IncrementConnectionCountNoLock();
+                            return new ValueTask<HttpConnection>((HttpConnection)null);
                         }
                         else
                         {
-                            // No valid cached connections.
-                            if (_associatedConnectionCount < _maxConnections)
-                            {
-                                // We are under the connection limit, so just increment the count and return null
-                                // to indicate to the caller that they should create a new connection.
-                                IncrementConnectionCountNoLock();
-                                return new ValueTask<HttpConnection>((HttpConnection)null);
-                            }
-                            else
-                            {
-                                // We've reached the connection limit and need to wait for an existing connection
-                                // to become available, or to be closed so that we can create a new connection.
-                                // Enqueue a waiter that will be signalled when this happens.
-                                // Break out of the loop and then do the actual wait below.
-                                waiter = EnqueueWaiter();
-                                break;
-                            }
-
-                            // Note that we don't check for _disposed.  We may end up disposing the
-                            // created connection when it's returned, but we don't want to block use
-                            // of the pool if it's already been disposed, as there's a race condition
-                            // between getting a pool and someone disposing of it, and we don't want
-                            // to complicate the logic about trying to get a different pool when the
-                            // retrieved one has been disposed of.  In the future we could alternatively
-                            // try returning such connections to whatever pool is currently considered
-                            // current for that endpoint, if there is one.
+                            // We've reached the connection limit and need to wait for an existing connection
+                            // to become available, or to be closed so that we can create a new connection.
+                            // Enqueue a waiter that will be signalled when this happens.
+                            // Break out of the loop and then do the actual wait below.
+                            waiter = EnqueueWaiter();
+                            break;
                         }
+
+                        // Note that we don't check for _disposed.  We may end up disposing the
+                        // created connection when it's returned, but we don't want to block use
+                        // of the pool if it's already been disposed, as there's a race condition
+                        // between getting a pool and someone disposing of it, and we don't want
+                        // to complicate the logic about trying to get a different pool when the
+                        // retrieved one has been disposed of.  In the future we could alternatively
+                        // try returning such connections to whatever pool is currently considered
+                        // current for that endpoint, if there is one.
                     }
                 }
 
@@ -340,9 +336,9 @@ namespace System.Net.Http
         }
 
         private async ValueTask<(HttpConnectionBase connection, bool isNewConnection, HttpResponseMessage failureResponse)>
-            GetHttpConnectionAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+            GetHttpConnectionAsync(ServiceAuthority desiredAuthority, HttpRequestMessage request, CancellationToken cancellationToken)
         {
-            HttpConnection connection = await GetOrReserveHttp11ConnectionAsync(cancellationToken).ConfigureAwait(false);
+            HttpConnection connection = await GetOrReserveHttp11ConnectionAsync(desiredAuthority, cancellationToken).ConfigureAwait(false);
             if (connection != null)
             {
                 return (connection, false, null);
@@ -369,7 +365,7 @@ namespace System.Net.Http
         }
 
         private async ValueTask<(HttpConnectionBase connection, bool isNewConnection, HttpResponseMessage failureResponse)>
-            GetHttp2ConnectionAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+            GetHttp2ConnectionAsync(ServiceAuthority desiredAuthority, HttpRequestMessage request, CancellationToken cancellationToken)
         {
             Debug.Assert(_kind == HttpConnectionKind.Https || _kind == HttpConnectionKind.SslProxyTunnel || _kind == HttpConnectionKind.Http);
 
@@ -541,13 +537,13 @@ namespace System.Net.Http
 
         public async Task<HttpResponseMessage> SendWithRetryAsync(HttpRequestMessage request, bool doRequestAuth, CancellationToken cancellationToken)
         {
-            bool waitForNextAuthority = false;
+            ServiceAuthority desiredAuthority = null;
 
             while (true)
             {
                 // Loop on connection failures and retry if possible.
 
-                (HttpConnectionBase connection, bool isNewConnection, HttpResponseMessage failureResponse) = await GetConnectionAsync(request, cancellationToken).ConfigureAwait(false);
+                (HttpConnectionBase connection, bool isNewConnection, HttpResponseMessage failureResponse) = await GetConnectionAsync(desiredAuthority, request, cancellationToken).ConfigureAwait(false);
                 if (failureResponse != null)
                 {
                     // Proxy tunnel failure; return proxy response
@@ -580,6 +576,7 @@ namespace System.Net.Http
                         if (!authority.IsOrigin)
                         {
                             response.Dispose();
+
                             lock (SyncObj)
                             {
                                 _unreliableAuthorities ??= new HashSet<(string alpnProtocolName, string host, int port)>();
@@ -602,10 +599,9 @@ namespace System.Net.Http
                                     }, TaskScheduler.Default);
                                 }
 
-                                StartAuthorityTransition(null, _originHost, _originPort, long.MaxValue);
+                                desiredAuthority = StartAuthorityTransition(null, _originHost, _originPort, long.MaxValue);
                             }
 
-                            waitForNextAuthority = true;
                             continue;
                         }
                     }
@@ -696,7 +692,7 @@ namespace System.Net.Http
         /// <summary>
         /// Sets up a transition to a new authority. Does not actually start connecting.
         /// </summary>
-        private void StartAuthorityTransition(string alpnProtocolName, string host, int port, long expireTicks)
+        private ServiceAuthority StartAuthorityTransition(string alpnProtocolName, string host, int port, long expireTicks)
         {
             Debug.Assert(Monitor.IsEntered(SyncObj));
 
@@ -708,6 +704,7 @@ namespace System.Net.Http
             _authority = next;
 
             // The connect() will start upon the next request to use this origin.
+            return next;
         }
 
         /// <summary>
@@ -727,6 +724,15 @@ namespace System.Net.Http
                 while (AltSvcHeaderParser.Parser.TryParseValue(altSvcValue, null, ref parseIdx, out object parsedValue))
                 {
                     var value = (AltSvcHeaderValue)parsedValue;
+
+                    //TODO: remove this lock.
+                    lock (SyncObj)
+                    {
+                        if (_unreliableAuthorities.Contains((value.AlpnProtocolName, value.Host, value.Port)))
+                        {
+                            continue;
+                        }
+                    }
 
                     switch (value.AlpnProtocolName)
                     {
@@ -1114,10 +1120,10 @@ namespace System.Net.Http
         {
             lock (SyncObj)
             {
-                if (_http2Connection == connection)
-                {
-                    _http2Connection = null;
-                }
+                var authority = (ServiceAuthority)connection.ServiceAuthority;
+                Debug.Assert(authority.Http2Connection == connection);
+
+                authority.Http2Connection = null;
             }
         }
 
@@ -1158,7 +1164,6 @@ namespace System.Net.Http
             TimeSpan pooledConnectionLifetime = _poolManager.Settings._pooledConnectionLifetime;
             TimeSpan pooledConnectionIdleTimeout = _poolManager.Settings._pooledConnectionIdleTimeout;
 
-            List<CachedConnection> list = _idleConnections;
             List<HttpConnection> toDispose = null;
             bool tookLock = false;
 
@@ -1167,72 +1172,27 @@ namespace System.Net.Http
                 if (NetEventSource.IsEnabled) Trace("Cleaning pool.");
                 Monitor.Enter(SyncObj, ref tookLock);
 
-                // Get the current time.  This is compared against each connection's last returned
-                // time to determine whether a connection is too old and should be closed.
-                long nowTicks = Environment.TickCount64;
-                Http2Connection http2Connection = _http2Connection;
+                int openConnections = 0;
 
-                if (http2Connection != null)
+                // Loop through active authorities, removing idle connections.
+                ServiceAuthority authority = _authority;
+                do
                 {
-                    if (http2Connection.IsExpired(nowTicks, pooledConnectionLifetime, pooledConnectionIdleTimeout))
-                    {
-                        http2Connection.Dispose();
-                        // We can set _http2Connection directly while holding lock instead of calling InvalidateHttp2Connection().
-                        _http2Connection = null;
-                    }
+                    authority.CleanupIdleConnections(pooledConnectionLifetime, pooledConnectionIdleTimeout, ref toDispose);
+                    openConnections += authority.OpenConnectionCount;
                 }
+                while ((authority = authority.PreviousAuthority) != null);
 
-                // Find the first item which needs to be removed.
-                int freeIndex = 0;
-                while (freeIndex < list.Count && list[freeIndex].IsUsable(nowTicks, pooledConnectionLifetime, pooledConnectionIdleTimeout, poll: true))
+                // If there are now no connections associated with this pool, we can dispose of it. We
+                // avoid aggressively cleaning up pools that have recently been used but currently aren't;
+                // if a pool was used since the last time we cleaned up, give it another chance. New pools
+                // start out saying they've recently been used, to give them a bit of breathing room and time
+                // for the initial collection to be added to it.
+                if (openConnections == 0 && !_usedSinceLastCleanup)
                 {
-                    freeIndex++;
-                }
-
-                // If freeIndex == list.Count, nothing needs to be removed.
-                // But if it's < list.Count, at least one connection needs to be purged.
-                if (freeIndex < list.Count)
-                {
-                    // We know the connection at freeIndex is unusable, so dispose of it.
-                    toDispose = new List<HttpConnection> { list[freeIndex]._connection };
-
-                    // Find the first item after the one to be removed that should be kept.
-                    int current = freeIndex + 1;
-                    while (current < list.Count)
-                    {
-                        // Look for the first item to be kept.  Along the way, any
-                        // that shouldn't be kept are disposed of.
-                        while (current < list.Count && !list[current].IsUsable(nowTicks, pooledConnectionLifetime, pooledConnectionIdleTimeout, poll: true))
-                        {
-                            toDispose.Add(list[current]._connection);
-                            current++;
-                        }
-
-                        // If we found something to keep, copy it down to the known free slot.
-                        if (current < list.Count)
-                        {
-                            // copy item to the free slot
-                            list[freeIndex++] = list[current++];
-                        }
-
-                        // Keep going until there are no more good items.
-                    }
-
-                    // At this point, good connections have been moved below freeIndex, and garbage connections have
-                    // been added to the dispose list, so clear the end of the list past freeIndex.
-                    list.RemoveRange(freeIndex, list.Count - freeIndex);
-
-                    // If there are now no connections associated with this pool, we can dispose of it. We
-                    // avoid aggressively cleaning up pools that have recently been used but currently aren't;
-                    // if a pool was used since the last time we cleaned up, give it another chance. New pools
-                    // start out saying they've recently been used, to give them a bit of breathing room and time
-                    // for the initial collection to be added to it.
-                    if (_associatedConnectionCount == 0 && !_usedSinceLastCleanup && _http2Connection == null)
-                    {
-                        Debug.Assert(list.Count == 0, $"Expected {nameof(list)}.{nameof(list.Count)} == 0");
-                        _disposed = true;
-                        return true; // Pool is disposed of.  It should be removed.
-                    }
+                    Debug.Assert(_authority.PreviousAuthority == null && _authority.OpenConnectionCount == 0, $"Expected {nameof(_authority)}.{nameof(_authority.OpenConnectionCount)} == 0");
+                    _disposed = true;
+                    return true; // Pool is disposed of.  It should be removed.
                 }
 
                 // Reset the cleanup flag.  Any pools that are empty and not used since the last cleanup
@@ -1272,11 +1232,11 @@ namespace System.Net.Http
             $"{nameof(HttpConnectionPool)} " +
             (_proxyUri == null ?
                 (_sslOptionsHttp11 == null ?
-                    $"http://{_host}:{_port}" :
-                    $"https://{_host}:{_port}" + (_sslOptionsHttp11.TargetHost != _host ? $", SSL TargetHost={_sslOptionsHttp11.TargetHost}" : null)) :
+                    $"http://{_originHost}:{_originPort}" :
+                    $"https://{_originHost}:{_originPort}" + (_sslOptionsHttp11.TargetHost != _originHost ? $", SSL TargetHost={_sslOptionsHttp11.TargetHost}" : null)) :
                 (_sslOptionsHttp11 == null ?
                     $"Proxy {_proxyUri}" :
-                    $"https://{_host}:{_port}/ tunnelled via Proxy {_proxyUri}" + (_sslOptionsHttp11.TargetHost != _host ? $", SSL TargetHost={_sslOptionsHttp11.TargetHost}" : null)));
+                    $"https://{_originHost}:{_originPort}/ tunnelled via Proxy {_proxyUri}" + (_sslOptionsHttp11.TargetHost != _originHost ? $", SSL TargetHost={_sslOptionsHttp11.TargetHost}" : null)));
 
         private void Trace(string message, [CallerMemberName] string memberName = null) =>
             NetEventSource.Log.HandlerMessage(

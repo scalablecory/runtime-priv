@@ -25,7 +25,7 @@ namespace System.Net.Http
 
             public bool IsOrigin => AltSvcAlpnProtocolName == null;
 
-            private readonly Stack<CachedConnection> IdleConnections = new Stack<CachedConnection>();
+            private readonly List<CachedConnection> IdleConnections = new List<CachedConnection>();
 
             public bool Http2Enabled = true;
             public Http2Connection Http2Connection;
@@ -34,6 +34,8 @@ namespace System.Net.Http
             public int ActiveRequestCount;
 
             public int IdleConnectionCount => IdleConnections.Count;
+
+            public int OpenConnectionCount => IdleConnectionCount + (Http2Connection != null ? 1 : 0);
 
             public bool IsActive => true;
 
@@ -74,14 +76,87 @@ namespace System.Net.Http
             public bool TryGetIdleConnection(out CachedConnection cachedConnection)
             {
                 //TODO:
-                return IdleConnections.TryPop(out cachedConnection);
+
+                List<CachedConnection> idleConnections = IdleConnections;
+
+                if (idleConnections.Count == 0)
+                {
+                    cachedConnection = default;
+                    return false;
+                }
+
+                cachedConnection = idleConnections[idleConnections.Count - 1];
+                idleConnections.RemoveAt(idleConnections.Count - 1);
+                return true;
             }
 
             public bool TryReturnConnection(HttpConnection connection)
             {
                 //TODO:
-                IdleConnections.Push(new CachedConnection(connection));
+                IdleConnections.Add(new CachedConnection(connection));
                 return true;
+            }
+
+            /// <summary>
+            /// Removes any idle connections from the pool.
+            /// </summary>
+            public List<HttpConnection> CleanupIdleConnections(TimeSpan pooledConnectionLifetime, TimeSpan pooledConnectionIdleTimeout, ref List<HttpConnection> connectionsToDispose)
+            {
+                long nowTicks = Environment.TickCount64;
+                Http2Connection http2Connection = Http2Connection;
+                List<CachedConnection> list = IdleConnections;
+
+                if (http2Connection != null)
+                {
+                    if (http2Connection.IsExpired(nowTicks, pooledConnectionLifetime, pooledConnectionIdleTimeout))
+                    {
+                        http2Connection.Dispose();
+                        // We can set _http2Connection directly while holding lock instead of calling InvalidateHttp2Connection().
+                        Http2Connection = null;
+                    }
+                }
+
+                // Find the first item which needs to be removed.
+                int freeIndex = 0;
+                while (freeIndex < list.Count && list[freeIndex].IsUsable(nowTicks, pooledConnectionLifetime, pooledConnectionIdleTimeout, poll: true))
+                {
+                    freeIndex++;
+                }
+
+                // If freeIndex == list.Count, nothing needs to be removed.
+                // But if it's < list.Count, at least one connection needs to be purged.
+                if (freeIndex < list.Count)
+                {
+                    // We know the connection at freeIndex is unusable, so dispose of it.
+                    connectionsToDispose ??= new List<HttpConnection>();
+                    connectionsToDispose.Add(list[freeIndex]._connection);
+
+                    // Find the first item after the one to be removed that should be kept.
+                    int current = freeIndex + 1;
+                    while (current < list.Count)
+                    {
+                        // Look for the first item to be kept.  Along the way, any
+                        // that shouldn't be kept are disposed of.
+                        while (current < list.Count && !list[current].IsUsable(nowTicks, pooledConnectionLifetime, pooledConnectionIdleTimeout, poll: true))
+                        {
+                            connectionsToDispose.Add(list[current]._connection);
+                            current++;
+                        }
+
+                        // If we found something to keep, copy it down to the known free slot.
+                        if (current < list.Count)
+                        {
+                            // copy item to the free slot
+                            list[freeIndex++] = list[current++];
+                        }
+
+                        // Keep going until there are no more good items.
+                    }
+
+                    // At this point, good connections have been moved below freeIndex, and garbage connections have
+                    // been added to the dispose list, so clear the end of the list past freeIndex.
+                    list.RemoveRange(freeIndex, list.Count - freeIndex);
+                }
             }
         }
     }
