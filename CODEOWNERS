@@ -1,0 +1,5 @@
+# NCL libraries
+/src/libraries/System.Net*/ @dotnet/ncl
+/src/libraries/System.Net.Quic/ @dotnet/ncl @dotnet/http3
+/src/libraries/Common/src/System/Net/ @dotnet/ncl
+/src/libraries/Common/src/System/Net/Http/Http2/ @dotnet/ncl @dotnet/http2
