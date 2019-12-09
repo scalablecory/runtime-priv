@@ -1,0 +1,7 @@
+# NCL libraries - primary
+/src/libraries/System.Net*/ @dotnet/ncl @scalablecory
+/src/libraries/Common/src/System/Net/ @dotnet/ncl
+
+# NCL libraries - secondary (last match is used, so these must come after the primary)
+/src/libraries/Common/src/System/Net/Http/Http2/ @dotnet/ncl @dotnet/http2
+/src/libraries/System.Net.Quic/ @dotnet/ncl @dotnet/http3
