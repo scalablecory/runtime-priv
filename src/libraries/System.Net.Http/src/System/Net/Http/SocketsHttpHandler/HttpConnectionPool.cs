@@ -274,14 +274,19 @@ namespace System.Net.Http
                 lock (SyncObj)
                 {
                     ServiceAuthority authority = desiredAuthority ?? _authority;
-                    if (authority.TryGetIdleConnection(out cachedConnection))
+                    if (authority.TryGetIdleHttp11Connection(out cachedConnection))
                     {
                         // We have a cached connection that we can attempt to use.
                         // Test it below outside the lock, to avoid doing expensive validation while holding the lock.
                     }
-                    else if (authority != desiredAuthority && (authority = authority.PreviousAuthority) != null && authority.TryGetIdleConnection(out cachedConnection))
+                    else if (authority != desiredAuthority && (authority = authority.PreviousAuthority) != null && authority.TryGetIdleHttp11Connection(out cachedConnection))
                     {
                         // The current authority has no idle connections. Use the previous authority to avoid waiting.
+
+                        if (_associatedConnectionCount < _maxConnections)
+                        {
+                            // TODO: start establishing a connection on the current authority in the background.
+                        }
                     }
                     else
                     {
@@ -311,6 +316,13 @@ namespace System.Net.Http
                         // retrieved one has been disposed of.  In the future we could alternatively
                         // try returning such connections to whatever pool is currently considered
                         // current for that endpoint, if there is one.
+                    }
+
+                    // If desiredAuthority is set, the connection is already reserved. Otherwise, reserve it here
+                    // to prevent the authority from being disposed.
+                    if (authority != desiredAuthority)
+                    {
+                        authority.ReserveConnection();
                     }
                 }
 
@@ -369,9 +381,36 @@ namespace System.Net.Http
         {
             Debug.Assert(_kind == HttpConnectionKind.Https || _kind == HttpConnectionKind.SslProxyTunnel || _kind == HttpConnectionKind.Http);
 
-            // See if we have an HTTP2 connection
-            Http2Connection http2Connection = _http2Connection;
+            ServiceAuthority authority;
+            Http2Connection http2Connection;
 
+            if (desiredAuthority != null)
+            {
+                // If desiredAuthority is set, it means SendWithRetryAsync got a 421 Misdirected Request,
+                // and desiredAuthority is set to our origin authority. Our connection has already been
+                // reserved, so we don't need to worry about it being disposed under us and can use it right away.
+                authority = desiredAuthority;
+                http2Connection = desiredAuthority.Http2Connection;
+            }
+            else
+            {
+                lock (SyncObj)
+                {
+                    authority = _authority;
+
+                    if (authority.TryGetHttp2Connection(out http2Connection))
+                    {
+                        // The current authority is active and has an established connection.
+                    }
+                    else if (authority.PreviousAuthority.TryGetHttp2Connection(out http2Connection) == true)
+                    {
+                        // The current authority is still spinning up: use the previous authority.
+                        authority = authority.PreviousAuthority;
+                    }
+                }
+            }
+
+            // See if we have an HTTP2 connection
             if (http2Connection != null)
             {
                 TimeSpan pooledConnectionLifetime = _poolManager.Settings._pooledConnectionLifetime;
@@ -600,6 +639,7 @@ namespace System.Net.Http
                                 }
 
                                 desiredAuthority = StartAuthorityTransition(null, _originHost, _originPort, long.MaxValue);
+                                desiredAuthority.ReserveConnection(); // Increment usage count to ensure the authority isn't removed.
                             }
 
                             continue;

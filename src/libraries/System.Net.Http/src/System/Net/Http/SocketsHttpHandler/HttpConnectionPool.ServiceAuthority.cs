@@ -30,6 +30,7 @@ namespace System.Net.Http
             public bool Http2Enabled = true;
             public Http2Connection Http2Connection;
             public SemaphoreSlim Http2ConnectionCreateLock;
+            public bool IsHttp2Connecting = false;
 
             public int ActiveRequestCount;
 
@@ -62,21 +63,19 @@ namespace System.Net.Http
                 }
             }
 
-            public void ReserveConnection()
+            public void IncrementActiveRequestCount()
             {
                 ++ActiveRequestCount;
             }
 
-            public void RemoveReservation()
+            public void DecrementActiveRequestCount()
             {
                 --ActiveRequestCount;
                 //TODO: if the authority is shutting down, and count is now 0, destroy the authority.
             }
 
-            public bool TryGetIdleConnection(out CachedConnection cachedConnection)
+            public bool TryGetIdleHttp11Connection(out CachedConnection cachedConnection)
             {
-                //TODO:
-
                 List<CachedConnection> idleConnections = IdleConnections;
 
                 if (idleConnections.Count == 0)
@@ -97,10 +96,16 @@ namespace System.Net.Http
                 return true;
             }
 
+            public bool TryGetHttp2Connection(out Http2Connection connection)
+            {
+                connection = null;
+                return false;
+            }
+
             /// <summary>
             /// Removes any idle connections from the pool.
             /// </summary>
-            public List<HttpConnection> CleanupIdleConnections(TimeSpan pooledConnectionLifetime, TimeSpan pooledConnectionIdleTimeout, ref List<HttpConnection> connectionsToDispose)
+            public void CleanupIdleConnections(TimeSpan pooledConnectionLifetime, TimeSpan pooledConnectionIdleTimeout, ref List<HttpConnection> connectionsToDispose)
             {
                 long nowTicks = Environment.TickCount64;
                 Http2Connection http2Connection = Http2Connection;
