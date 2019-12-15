@@ -284,11 +284,11 @@ namespace System.Net.Http
 }
 namespace System.Net.Http.Headers
 {
-    public sealed partial class AlternateService
+    public sealed partial class AltSvcHeaderValue
     {
-        public AlternateService(string alpnProtocolName, string host, int port, System.TimeSpan maxAge) { }
+        public AltSvcHeaderValue(string alpnProtocolName, string host, int port, System.TimeSpan maxAge) { }
         public string AlpnProtocolName { get { throw null; } }
-        public static System.Net.Http.Headers.AlternateService Clear { get { throw null; } }
+        public static System.Net.Http.Headers.AltSvcHeaderValue Clear { get { throw null; } }
         public string Host { get { throw null; } }
         public System.TimeSpan MaxAge { get { throw null; } }
         public int Port { get { throw null; } }

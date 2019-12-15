@@ -13,9 +13,9 @@ namespace System.Net.Http
 {
     internal abstract class HttpConnectionBase : IHttpTrace
     {
-        public ServiceAuthorityBase ServiceAuthority { get; }
+        public HttpConnectionPool.ServiceAuthority ServiceAuthority { get; }
 
-        protected HttpConnectionBase(ServiceAuthorityBase serviceAuthority)
+        protected HttpConnectionBase(HttpConnectionPool.ServiceAuthority serviceAuthority)
         {
             Debug.Assert(serviceAuthority != null);
             ServiceAuthority = serviceAuthority;

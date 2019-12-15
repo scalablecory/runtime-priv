@@ -103,7 +103,7 @@ namespace System.Net.Http
         // this value, so this is not a hard maximum size.
         private const int UnflushedOutgoingBufferSize = 32 * 1024;
 
-        public Http2Connection(HttpConnectionPool pool, ServiceAuthorityBase authority, Stream stream, string altSvcHost, int altSvcPort)
+        public Http2Connection(HttpConnectionPool pool, HttpConnectionPool.ServiceAuthority authority, Stream stream, string altSvcHost, int altSvcPort)
             : base(authority)
         {
             _pool = pool;

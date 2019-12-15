@@ -13,7 +13,7 @@ namespace System.Net.Http
 {
     internal partial class HttpConnectionPool
     {
-        private sealed class ServiceAuthority : ServiceAuthorityBase, IDisposable
+        internal sealed class ServiceAuthority : IDisposable
         {
             public ServiceAuthority PreviousAuthority;
             public ServiceAuthority NextAuthority;
@@ -164,9 +164,5 @@ namespace System.Net.Http
                 }
             }
         }
-    }
-
-    internal class ServiceAuthorityBase
-    {
     }
 }

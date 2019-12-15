@@ -64,7 +64,7 @@ namespace System.Net.Http
                         if (response.Headers.ConnectionClose.GetValueOrDefault())
                         {
                             // Server is closing the connection and asking us to authenticate on a new connection.
-                            (connection, response) = await connectionPool.CreateHttp11ConnectionAsync(request, cancellationToken).ConfigureAwait(false);
+                            (connection, response) = await connectionPool.CreateHttp11ConnectionAsync(connection.ServiceAuthority, request, cancellationToken).ConfigureAwait(false);
                             if (response != null)
                             {
                                 return response;

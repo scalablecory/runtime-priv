@@ -71,7 +71,7 @@ namespace System.Net.Http
 
         public HttpConnection(
             HttpConnectionPool pool,
-            ServiceAuthorityBase authority,
+            HttpConnectionPool.ServiceAuthority authority,
             Socket socket,
             Stream stream,
             TransportContext transportContext,
@@ -1851,7 +1851,7 @@ namespace System.Net.Http
 
     internal sealed class HttpConnectionWithFinalizer : HttpConnection
     {
-        public HttpConnectionWithFinalizer(HttpConnectionPool pool, ServiceAuthorityBase authority, Socket socket, Stream stream, TransportContext transportContext, byte[] encodedAltUsedHeader) : base(pool, authority, socket, stream, transportContext, encodedAltUsedHeader) { }
+        public HttpConnectionWithFinalizer(HttpConnectionPool pool, HttpConnectionPool.ServiceAuthority authority, Socket socket, Stream stream, TransportContext transportContext, byte[] encodedAltUsedHeader) : base(pool, authority, socket, stream, transportContext, encodedAltUsedHeader) { }
 
         // This class is separated from HttpConnection so we only pay the price of having a finalizer
         // when it's actually needed, e.g. when MaxConnectionsPerServer is enabled.

@@ -322,7 +322,7 @@ namespace System.Net.Http
                     // to prevent the authority from being disposed.
                     if (authority != desiredAuthority)
                     {
-                        authority.ReserveConnection();
+                        authority.IncrementActiveRequestCount();
                     }
                 }
 
@@ -361,7 +361,7 @@ namespace System.Net.Http
             try
             {
                 HttpResponseMessage failureResponse;
-                (connection, failureResponse) = await CreateHttp11ConnectionAsync(request, cancellationToken).ConfigureAwait(false);
+                (connection, failureResponse) = await CreateHttp11ConnectionAsync(desiredAuthority, request, cancellationToken).ConfigureAwait(false);
                 if (connection == null)
                 {
                     Debug.Assert(failureResponse != null);
@@ -430,13 +430,13 @@ namespace System.Net.Http
             }
 
             // Ensure that the connection creation semaphore is created
-            if (_http2ConnectionCreateLock == null)
+            if (authority.Http2ConnectionCreateLock == null)
             {
                 lock (SyncObj)
                 {
-                    if (_http2ConnectionCreateLock == null)
+                    if (authority.Http2ConnectionCreateLock == null)
                     {
-                        _http2ConnectionCreateLock = new SemaphoreSlim(1);
+                        authority.Http2ConnectionCreateLock = new SemaphoreSlim(1);
                     }
                 }
             }
@@ -447,10 +447,10 @@ namespace System.Net.Http
             TransportContext transportContext = null;
 
             // Serialize creation attempt
-            await _http2ConnectionCreateLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+            await authority.Http2ConnectionCreateLock.WaitAsync(cancellationToken).ConfigureAwait(false);
             try
             {
-                if (_http2Connection != null)
+                if (authority.Http2Connection != null)
                 {
                     // Someone beat us to it
 
@@ -459,11 +459,12 @@ namespace System.Net.Http
                         Trace("Using existing HTTP2 connection.");
                     }
 
-                    return (_http2Connection, false, null);
+                    authority.IncrementActiveRequestCount();
+                    return (authority.Http2Connection, false, null);
                 }
 
                 // Recheck if HTTP2 has been disabled by a previous attempt.
-                if (_http2Enabled)
+                if (authority.Http2Enabled)
                 {
                     if (NetEventSource.IsEnabled)
                     {
@@ -473,7 +474,7 @@ namespace System.Net.Http
                     Stream stream;
                     HttpResponseMessage failureResponse;
                     (socket, stream, transportContext, failureResponse) =
-                        await ConnectAsync(request, true, cancellationToken).ConfigureAwait(false);
+                        await ConnectAsync(request, authority, true, cancellationToken).ConfigureAwait(false);
                     if (failureResponse != null)
                     {
                         return (null, true, failureResponse);
@@ -481,18 +482,18 @@ namespace System.Net.Http
 
                     if (_kind == HttpConnectionKind.Http)
                     {
-                        http2Connection = new Http2Connection(this, stream, null, 0);
+                        http2Connection = new Http2Connection(this, authority, stream, authority.Host, authority.Port);
                         await http2Connection.SetupAsync().ConfigureAwait(false);
 
-                        Debug.Assert(_http2Connection == null);
-                        _http2Connection = http2Connection;
+                        Debug.Assert(authority.Http2Connection == null);
+                        authority.Http2Connection = http2Connection;
 
                         if (NetEventSource.IsEnabled)
                         {
                             Trace("New unencrypted HTTP2 connection established.");
                         }
 
-                        return (_http2Connection, true, null);
+                        return (http2Connection, true, null);
                     }
 
                     sslStream = (SslStream)stream;
@@ -505,24 +506,24 @@ namespace System.Net.Http
                             throw new HttpRequestException(SR.Format(SR.net_ssl_http2_requires_tls12, sslStream.SslProtocol));
                         }
 
-                        http2Connection = new Http2Connection(this, sslStream, null, 0);
+                        http2Connection = new Http2Connection(this, authority, sslStream, authority.Host, authority.Port);
                         await http2Connection.SetupAsync().ConfigureAwait(false);
 
-                        Debug.Assert(_http2Connection == null);
-                        _http2Connection = http2Connection;
+                        Debug.Assert(authority.Http2Connection == null);
+                        authority.Http2Connection = http2Connection;
 
                         if (NetEventSource.IsEnabled)
                         {
                             Trace("New HTTP2 connection established.");
                         }
 
-                        return (_http2Connection, true, null);
+                        return (http2Connection, true, null);
                     }
                 }
             }
             finally
             {
-                _http2ConnectionCreateLock.Release();
+                authority.Http2ConnectionCreateLock.Release();
             }
 
             if (sslStream != null)
@@ -537,7 +538,7 @@ namespace System.Net.Http
                 bool canUse = true;
                 lock (SyncObj)
                 {
-                    _http2Enabled = false;
+                    authority.Http2Enabled = false;
 
                     if (_associatedConnectionCount < _maxConnections)
                     {
@@ -557,7 +558,7 @@ namespace System.Net.Http
 
                 if (canUse)
                 {
-                    return (ConstructHttp11Connection(socket, sslStream, transportContext), true, null);
+                    return (ConstructHttp11Connection(authority, socket, sslStream, transportContext), true, null);
                 }
                 else
                 {
@@ -571,7 +572,7 @@ namespace System.Net.Http
             }
 
             // If we reach this point, it means we need to fall back to a (new or existing) HTTP/1.1 connection.
-            return await GetHttpConnectionAsync(request, cancellationToken).ConfigureAwait(false);
+            return await GetHttpConnectionAsync(desiredAuthority, request, cancellationToken).ConfigureAwait(false);
         }
 
         public async Task<HttpResponseMessage> SendWithRetryAsync(HttpRequestMessage request, bool doRequestAuth, CancellationToken cancellationToken)
@@ -639,7 +640,7 @@ namespace System.Net.Http
                                 }
 
                                 desiredAuthority = StartAuthorityTransition(null, _originHost, _originPort, long.MaxValue);
-                                desiredAuthority.ReserveConnection(); // Increment usage count to ensure the authority isn't removed.
+                                desiredAuthority.IncrementActiveRequestCount(); // Increment usage count here to ensure the authority isn't removed once the lock is taken.
                             }
 
                             continue;
@@ -851,7 +852,7 @@ namespace System.Net.Http
             return SendWithProxyAuthAsync(request, doRequestAuth, cancellationToken);
         }
 
-        private async ValueTask<(ServiceAuthority, Socket, Stream, TransportContext, HttpResponseMessage)> ConnectAsync(HttpRequestMessage request, bool allowHttp2, CancellationToken cancellationToken)
+        private async ValueTask<(Socket, Stream, TransportContext, HttpResponseMessage)> ConnectAsync(HttpRequestMessage request, ServiceAuthority authority, bool useHttp2, CancellationToken cancellationToken)
         {
             // If a non-infinite connect timeout has been set, create and use a new CancellationToken that'll be canceled
             // when either the original token is canceled or a connect timeout occurs.
@@ -863,8 +864,6 @@ namespace System.Net.Http
                 cancellationToken = cancellationWithConnectTimeout.Token;
             }
 
-            ServiceAuthority authority = null;
-
             try
             {
                 Stream stream = null;
@@ -873,11 +872,6 @@ namespace System.Net.Http
                     case HttpConnectionKind.Http:
                     case HttpConnectionKind.Https:
                     case HttpConnectionKind.ProxyConnect:
-                        lock (SyncObj)
-                        {
-                            authority = _authority;
-                            authority.ReserveConnection();
-                        }
                         stream = await ConnectHelper.ConnectAsync(authority.Host, authority.Port, cancellationToken).ConfigureAwait(false);
                         break;
 
@@ -893,7 +887,7 @@ namespace System.Net.Http
                         {
                             // Return non-success response from proxy.
                             response.RequestMessage = request;
-                            return (null, null, null, null, response);
+                            return (null, null, null, response);
                         }
                         break;
                 }
@@ -903,23 +897,12 @@ namespace System.Net.Http
                 TransportContext transportContext = null;
                 if (_kind == HttpConnectionKind.Https || _kind == HttpConnectionKind.SslProxyTunnel)
                 {
-                    SslStream sslStream = await ConnectHelper.EstablishSslConnectionAsync(allowHttp2 ? _sslOptionsHttp2 : _sslOptionsHttp11, request, stream, cancellationToken).ConfigureAwait(false);
+                    SslStream sslStream = await ConnectHelper.EstablishSslConnectionAsync(useHttp2 ? _sslOptionsHttp2 : _sslOptionsHttp11, request, stream, cancellationToken).ConfigureAwait(false);
                     stream = sslStream;
                     transportContext = sslStream.TransportContext;
                 }
 
-                return (authority, socket, stream, transportContext, null);
-            }
-            catch
-            {
-                if (authority != null)
-                {
-                    lock (SyncObj)
-                    {
-                        authority.RemoveReservation();
-                    }
-                }
-                throw;
+                return (socket, stream, transportContext, null);
             }
             finally
             {
@@ -927,17 +910,26 @@ namespace System.Net.Http
             }
         }
 
-        internal async ValueTask<(HttpConnection, HttpResponseMessage)> CreateHttp11ConnectionAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        internal async ValueTask<(HttpConnection, HttpResponseMessage)> CreateHttp11ConnectionAsync(ServiceAuthority desiredAuthority, HttpRequestMessage request, CancellationToken cancellationToken)
         {
-            (ServiceAuthority authority, Socket socket, Stream stream, TransportContext transportContext, HttpResponseMessage failureResponse) =
-                await ConnectAsync(request, false, cancellationToken).ConfigureAwait(false);
+            if (desiredAuthority == null)
+            {
+                lock (SyncObj)
+                {
+                    desiredAuthority = _authority;
+                    desiredAuthority.IncrementActiveRequestCount();
+                }
+            }
+
+            (Socket socket, Stream stream, TransportContext transportContext, HttpResponseMessage failureResponse) =
+                await ConnectAsync(request, desiredAuthority, false, cancellationToken).ConfigureAwait(false);
 
             if (failureResponse != null)
             {
                 return (null, failureResponse);
             }
 
-            return (ConstructHttp11Connection(authority, socket, stream, transportContext), null);
+            return (ConstructHttp11Connection(desiredAuthority, socket, stream, transportContext), null);
         }
 
         private HttpConnection ConstructHttp11Connection(ServiceAuthority authority, Socket socket, Stream stream, TransportContext transportContext)
@@ -1288,7 +1280,7 @@ namespace System.Net.Http
 
         /// <summary>A cached idle connection and metadata about it.</summary>
         [StructLayout(LayoutKind.Auto)]
-        private readonly struct CachedConnection : IEquatable<CachedConnection>
+        internal readonly struct CachedConnection : IEquatable<CachedConnection>
         {
             /// <summary>The cached connection.</summary>
             internal readonly HttpConnection _connection;
