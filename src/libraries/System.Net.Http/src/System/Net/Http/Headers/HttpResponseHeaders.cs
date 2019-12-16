@@ -16,7 +16,8 @@ namespace System.Net.Http.Headers
         private const int ServerSlot = 2;
         private const int VarySlot = 3;
         private const int WwwAuthenticateSlot = 4;
-        private const int NumCollectionsSlots = 5;
+        private const int AltSvcSlot = 5;
+        private const int NumCollectionsSlots = 6;
 
         private object[] _specialCollectionsSlots;
         private HttpGeneralHeaders _generalHeaders;
@@ -46,6 +47,9 @@ namespace System.Net.Http.Headers
             get { return HeaderUtilities.GetTimeSpanValue(KnownHeaders.Age.Descriptor, this); }
             set { SetOrRemoveParsedValue(KnownHeaders.Age.Descriptor, value); }
         }
+
+        public HttpHeaderValueCollection<AltSvcHeaderValue> AltSvc
+            => GetSpecializedCollection(AltSvcSlot, thisRef => new HttpHeaderValueCollection<AltSvcHeaderValue>(KnownHeaders.AltSvc.Descriptor, thisRef));
 
         public EntityTagHeaderValue ETag
         {

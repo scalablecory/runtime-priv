@@ -4,10 +4,12 @@
 
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Runtime.InteropServices;
 
 namespace System.Net.Http
 {
@@ -15,6 +17,11 @@ namespace System.Net.Http
     {
         internal sealed class ServiceAuthority : IDisposable
         {
+            public const string UnknownAlpnProtocolName = null;
+
+            private int _activeRequestCount;
+            private AuthorityState _state = AuthorityState.TakingRequests;
+
             public ServiceAuthority PreviousAuthority;
             public ServiceAuthority NextAuthority;
 
@@ -32,13 +39,11 @@ namespace System.Net.Http
             public SemaphoreSlim Http2ConnectionCreateLock;
             public bool IsHttp2Connecting = false;
 
-            public int ActiveRequestCount;
-
+            public int ActiveRequestCount => _activeRequestCount;
             public int IdleConnectionCount => IdleConnections.Count;
-
             public int OpenConnectionCount => IdleConnectionCount + (Http2Connection != null ? 1 : 0);
 
-            public bool IsActive => true;
+            public bool IsTakingRequests => _state.HasFlag(AuthorityState.TakingRequests);
 
             public ServiceAuthority(string alpnProtocolName, string host, int port, long expireTicks)
             {
@@ -54,6 +59,7 @@ namespace System.Net.Http
                 {
                     connection._connection.Dispose();
                 }
+
                 IdleConnections.Clear();
 
                 if (Http2Connection != null)
@@ -63,15 +69,40 @@ namespace System.Net.Http
                 }
             }
 
-            public void IncrementActiveRequestCount()
+            /// <summary>
+            /// If an authority is still taking requests, increments the request count.
+            /// </summary>
+            /// <returns>True if the request count was incremented. Otherwise, false.</returns>
+            public bool TryIncrementActiveRequestCount()
             {
-                ++ActiveRequestCount;
+                AuthorityState state = _state;
+
+                if (state.HasFlag(AuthorityState.TakingRequests) && Environment.TickCount64 < ExpireTicks)
+                {
+                    ++_activeRequestCount;
+                    return true;
+                }
+
+                return false;
             }
 
+            /// <summary>
+            /// Decrements the active request count. If the authority is shutting down and the active count reaches 0, this disposes the authority.
+            /// </summary>
             public void DecrementActiveRequestCount()
             {
-                --ActiveRequestCount;
-                //TODO: if the authority is shutting down, and count is now 0, destroy the authority.
+                if (--_activeRequestCount == 0 && !_state.HasFlag(AuthorityState.TakingRequests))
+                {
+                    // TODO: dispose the authority.
+                }
+            }
+
+            /// <summary>
+            /// Sets the authority to a forced transition state.
+            /// </summary>
+            public void SetAsDefunct()
+            {
+                _state = AuthorityState.Transitioning;
             }
 
             public bool TryGetIdleHttp11Connection(out CachedConnection cachedConnection)
@@ -162,6 +193,22 @@ namespace System.Net.Http
                     // been added to the dispose list, so clear the end of the list past freeIndex.
                     list.RemoveRange(freeIndex, list.Count - freeIndex);
                 }
+            }
+
+            [Flags]
+            private enum AuthorityState
+            {
+                /// <summary>
+                /// The authority is taking requests.
+                /// </summary>
+                TakingRequests = 1,
+
+                /// <summary>
+                /// The authority in is transitioning to <seealso cref="NextAuthority"/>.
+                /// If <see cref="TakingRequests"/> is set, this authority can still be used if the next authority has no pooled connections.
+                /// If <see cref="TakingRequests"/> is not set, this authority must not be used.
+                /// </summary>
+                Transitioning = 2
             }
         }
     }

@@ -23,6 +23,12 @@ namespace System.Net.Http.Headers
         /// </summary>
         public TimeSpan MaxAge { get; }
 
+        /// <summary>
+        /// If true, the service should persist across network changes.
+        /// Otherwise, the service should be invalidated if a network change is detected.
+        /// </summary>
+        //public bool Persist { get; }
+
         public AltSvcHeaderValue(string alpnProtocolName, string host, int port, TimeSpan maxAge)
         {
             AlpnProtocolName = alpnProtocolName;

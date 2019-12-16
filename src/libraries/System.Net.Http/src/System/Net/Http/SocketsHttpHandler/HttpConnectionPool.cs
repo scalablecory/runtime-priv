@@ -84,7 +84,7 @@ namespace System.Net.Http
             _maxConnections = maxConnections;
 
             // Default authority to origin.
-            _authority = new ServiceAuthority(null, host, port, long.MaxValue);
+            _authority = new ServiceAuthority(ServiceAuthority.UnknownAlpnProtocolName, host, port, long.MaxValue);
 
             _http2Enabled = (_poolManager.Settings._maxHttpVersion == HttpVersion.Version20);
 
@@ -243,17 +243,31 @@ namespace System.Net.Http
         /// <summary>Object used to synchronize access to state in the pool.</summary>
         private object SyncObj { get; } = new object(); // TODO: some other object we can use?
 
+        /// <summary>
+        /// Retrieves a <see cref="HttpConnectionBase"/> for the request, either from the idle pool or creating a new connection.
+        /// </summary>
+        /// <param name="desiredAuthority">
+        /// If non-null, the authority the connection should be made through.
+        /// If null, the authority will be chosen based on the status of pooled connections.
+        /// </param>
         private ValueTask<(HttpConnectionBase connection, bool isNewConnection, HttpResponseMessage failureResponse)>
-            GetConnectionAsync(ServiceAuthority authority, HttpRequestMessage request, CancellationToken cancellationToken)
+            GetConnectionAsync(ServiceAuthority desiredAuthority, HttpRequestMessage request, CancellationToken cancellationToken)
         {
             if (_http2Enabled && request.Version.Major >= 2)
             {
-                return GetHttp2ConnectionAsync(authority, request, cancellationToken);
+                return GetHttp2ConnectionAsync(desiredAuthority, request, cancellationToken);
             }
 
-            return GetHttpConnectionAsync(authority, request, cancellationToken);
+            return GetHttpConnectionAsync(desiredAuthority, request, cancellationToken);
         }
 
+        /// <summary>
+        /// Retrieves a <see cref="HttpConnection"/>, either from the idle pool or creating a new connection.
+        /// </summary>
+        /// <param name="desiredAuthority">
+        /// If non-null, the authority the connection should be made through.
+        /// If null, the authority will be chosen based on the status of pooled connections.
+        /// </param>
         private ValueTask<HttpConnection> GetOrReserveHttp11ConnectionAsync(ServiceAuthority desiredAuthority, CancellationToken cancellationToken)
         {
             if (cancellationToken.IsCancellationRequested)
@@ -274,12 +288,12 @@ namespace System.Net.Http
                 lock (SyncObj)
                 {
                     ServiceAuthority authority = desiredAuthority ?? _authority;
-                    if (authority.TryGetIdleHttp11Connection(out cachedConnection))
+                    if (authority.IsTakingRequests && authority.TryGetIdleHttp11Connection(out cachedConnection))
                     {
                         // We have a cached connection that we can attempt to use.
                         // Test it below outside the lock, to avoid doing expensive validation while holding the lock.
                     }
-                    else if (authority != desiredAuthority && (authority = authority.PreviousAuthority) != null && authority.TryGetIdleHttp11Connection(out cachedConnection))
+                    else if (authority != desiredAuthority && (authority = authority.PreviousAuthority) != null && authority.IsTakingRequests && authority.TryGetIdleHttp11Connection(out cachedConnection))
                     {
                         // The current authority has no idle connections. Use the previous authority to avoid waiting.
 
@@ -649,7 +663,8 @@ namespace System.Net.Http
 
                     if (_altSvcEnabled)
                     {
-                        if (response.Headers.TryGetValues(KnownHeaders.AltSvc.Name, out IEnumerable<string> altSvcValues))
+                        HttpHeaderValueCollection<AltSvcHeaderValue> altSvcValues = response.Headers.AltSvc;
+                        if (altSvcValues?.Count != 0)
                         {
                             HandleAltSvcHeader(altSvcValues, response);
                         }
@@ -673,9 +688,9 @@ namespace System.Net.Http
         /// <summary>
         /// Reads the Alt-Svc header and possibly starts an authority transition.
         /// </summary>
-        private void HandleAltSvcHeader(IEnumerable<string> altSvcValues, HttpResponseMessage responseMessage)
+        private void HandleAltSvcHeader(IEnumerable<AltSvcHeaderValue> values, HttpResponseMessage responseMessage)
         {
-            AltSvcHeaderValue value = FindAppropriateAltSvc(altSvcValues);
+            AltSvcHeaderValue value = FindAppropriateAltSvc(values);
 
             if (value == null)
             {
@@ -755,47 +770,41 @@ namespace System.Net.Http
         /// Per RFC, alternate services must be given in the priority the origin would like the client to try.
         /// This looks over the list and returns the first eligible entry.
         /// </remarks>
-        private AltSvcHeaderValue FindAppropriateAltSvc(IEnumerable<string> altSvcValues)
+        private AltSvcHeaderValue FindAppropriateAltSvc(IEnumerable<AltSvcHeaderValue> altSvcValues)
         {
             AltSvcHeaderValue keptValue = null;
 
-            foreach (string altSvcValue in altSvcValues)
+            foreach (AltSvcHeaderValue value in altSvcValues)
             {
-                int parseIdx = 0;
-                while (AltSvcHeaderParser.Parser.TryParseValue(altSvcValue, null, ref parseIdx, out object parsedValue))
+                lock (SyncObj)
                 {
-                    var value = (AltSvcHeaderValue)parsedValue;
-
                     //TODO: remove this lock.
-                    lock (SyncObj)
+                    if (_unreliableAuthorities.Contains((value.AlpnProtocolName, value.Host, value.Port)))
                     {
-                        if (_unreliableAuthorities.Contains((value.AlpnProtocolName, value.Host, value.Port)))
+                        continue;
+                    }
+                }
+
+                switch (value.AlpnProtocolName)
+                {
+                    case "clear":
+                        // 'clear' indicates we should clear our alternate service cache,
+                        // and start using the stop using any current Alt-Svc.
+                        // It *should* be the only value here, but the RFC recommends
+                        // leniency -- any other values in the response should be ignored.
+                        return value;
+                    case "h2":
+                        if (_kind == HttpConnectionKind.Http)
                         {
-                            continue;
+                            // Don't change from plaintext to secure.
+                            break;
                         }
-                    }
 
-                    switch (value.AlpnProtocolName)
-                    {
-                        case "clear":
-                            // 'clear' indicates we should clear our alternate service cache,
-                            // and start using the stop using any current Alt-Svc.
-                            // It *should* be the only value here, but the RFC recommends
-                            // leniency -- any other values in the response should be ignored.
-                            return value;
-                        case "h2":
-                            if (_kind == HttpConnectionKind.Http)
-                            {
-                                // Don't change from plaintext to secure.
-                                break;
-                            }
-
-                            keptValue ??= value;
-                            break;
-                        case "http/1.1":
-                            keptValue ??= value;
-                            break;
-                    }
+                        keptValue ??= value;
+                        break;
+                    case "http/1.1":
+                        keptValue ??= value;
+                        break;
                 }
             }
 
@@ -1277,70 +1286,5 @@ namespace System.Net.Http
                 0,                           // request ID
                 memberName,                  // method name
                 message);                    // message
-
-        /// <summary>A cached idle connection and metadata about it.</summary>
-        [StructLayout(LayoutKind.Auto)]
-        internal readonly struct CachedConnection : IEquatable<CachedConnection>
-        {
-            /// <summary>The cached connection.</summary>
-            internal readonly HttpConnection _connection;
-            /// <summary>The last tick count at which the connection was used.</summary>
-            internal readonly long _returnedTickCount;
-
-            /// <summary>Initializes the cached connection and its associated metadata.</summary>
-            /// <param name="connection">The connection.</param>
-            public CachedConnection(HttpConnection connection)
-            {
-                Debug.Assert(connection != null);
-                _connection = connection;
-                _returnedTickCount = Environment.TickCount64;
-            }
-
-            /// <summary>Gets whether the connection is currently usable.</summary>
-            /// <param name="nowTicks">The current tick count.  Passed in to amortize the cost of calling Environment.TickCount.</param>
-            /// <param name="pooledConnectionLifetime">How long a connection can be open to be considered reusable.</param>
-            /// <param name="pooledConnectionIdleTimeout">How long a connection can have been idle in the pool to be considered reusable.</param>
-            /// <returns>
-            /// true if we believe the connection can be reused; otherwise, false.  There is an inherent race condition here,
-            /// in that the server could terminate the connection or otherwise make it unusable immediately after we check it,
-            /// but there's not much difference between that and starting to use the connection and then having the server
-            /// terminate it, which would be considered a failure, so this race condition is largely benign and inherent to
-            /// the nature of connection pooling.
-            /// </returns>
-            public bool IsUsable(
-                long nowTicks,
-                TimeSpan pooledConnectionLifetime,
-                TimeSpan pooledConnectionIdleTimeout,
-                bool poll = false)
-            {
-                // Validate that the connection hasn't been idle in the pool for longer than is allowed.
-                if ((pooledConnectionIdleTimeout != Timeout.InfiniteTimeSpan) &&
-                    ((nowTicks - _returnedTickCount) > pooledConnectionIdleTimeout.TotalMilliseconds))
-                {
-                    if (NetEventSource.IsEnabled) _connection.Trace($"Connection no longer usable. Idle {TimeSpan.FromMilliseconds((nowTicks - _returnedTickCount))} > {pooledConnectionIdleTimeout}.");
-                    return false;
-                }
-
-                // Validate that the connection hasn't been alive for longer than is allowed.
-                if (_connection.LifetimeExpired(nowTicks, pooledConnectionLifetime))
-                {
-                    return false;
-                }
-
-                // Validate that the connection hasn't received any stray data while in the pool.
-                if (poll && _connection.PollRead())
-                {
-                    if (NetEventSource.IsEnabled) _connection.Trace($"Connection no longer usable. Unexpected data received.");
-                    return false;
-                }
-
-                // The connection is usable.
-                return true;
-            }
-
-            public bool Equals(CachedConnection other) => ReferenceEquals(other._connection, _connection);
-            public override bool Equals(object obj) => obj is CachedConnection && Equals((CachedConnection)obj);
-            public override int GetHashCode() => _connection?.GetHashCode() ?? 0;
-        }
     }
 }
