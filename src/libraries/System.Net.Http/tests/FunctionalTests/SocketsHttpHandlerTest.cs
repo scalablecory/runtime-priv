@@ -21,6 +21,13 @@ using Xunit.Abstractions;
 
 namespace System.Net.Http.Functional.Tests
 {
+    public sealed class SocketsHttpHandler_HttpClientHandler_AltSvc_Test : HttpClientHandler_AltSvc_Test
+    {
+        protected override bool UseSocketsHttpHandler => true;
+
+        public SocketsHttpHandler_HttpClientHandler_AltSvc_Test(ITestOutputHelper output) : base(output) { }
+    }
+
     public sealed class SocketsHttpHandler_HttpClientHandler_Asynchrony_Test : HttpClientHandler_Asynchrony_Test
     {
         protected override bool UseSocketsHttpHandler => true;

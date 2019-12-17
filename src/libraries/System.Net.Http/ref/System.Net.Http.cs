@@ -471,6 +471,7 @@ namespace System.Net.Http.Headers
         internal HttpResponseHeaders() { }
         public System.Net.Http.Headers.HttpHeaderValueCollection<string> AcceptRanges { get { throw null; } }
         public System.TimeSpan? Age { get { throw null; } set { } }
+        public System.Net.Http.Headers.HttpHeaderValueCollection<System.Net.Http.Headers.AltSvcHeaderValue> AltSvc {  get { throw null; } }
         public System.Net.Http.Headers.CacheControlHeaderValue CacheControl { get { throw null; } set { } }
         public System.Net.Http.Headers.HttpHeaderValueCollection<string> Connection { get { throw null; } }
         public bool? ConnectionClose { get { throw null; } set { } }

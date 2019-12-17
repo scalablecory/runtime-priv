@@ -70,20 +70,12 @@ namespace System.Net.Http
             }
 
             /// <summary>
-            /// If an authority is still taking requests, increments the request count.
+            /// Increments the request count, preventing disposal.
             /// </summary>
-            /// <returns>True if the request count was incremented. Otherwise, false.</returns>
-            public bool TryIncrementActiveRequestCount()
+            public void IncrementActiveRequestCount()
             {
-                AuthorityState state = _state;
-
-                if (state.HasFlag(AuthorityState.TakingRequests) && Environment.TickCount64 < ExpireTicks)
-                {
-                    ++_activeRequestCount;
-                    return true;
-                }
-
-                return false;
+                Debug.Assert(_state.HasFlag(AuthorityState.TakingRequests) && Environment.TickCount64 < ExpireTicks);
+                ++_activeRequestCount;
             }
 
             /// <summary>

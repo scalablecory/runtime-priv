@@ -268,11 +268,11 @@ namespace System.Net.Http
         /// If non-null, the authority the connection should be made through.
         /// If null, the authority will be chosen based on the status of pooled connections.
         /// </param>
-        private ValueTask<HttpConnection> GetOrReserveHttp11ConnectionAsync(ServiceAuthority desiredAuthority, CancellationToken cancellationToken)
+        private ValueTask<(ServiceAuthority, HttpConnection)> GetOrReserveHttp11ConnectionAsync(ServiceAuthority desiredAuthority, CancellationToken cancellationToken)
         {
             if (cancellationToken.IsCancellationRequested)
             {
-                return new ValueTask<HttpConnection>(Task.FromCanceled<HttpConnection>(cancellationToken));
+                return new ValueTask<(ServiceAuthority, HttpConnection)>(Task.FromCanceled<(ServiceAuthority, HttpConnection)>(cancellationToken));
             }
 
             TimeSpan pooledConnectionLifetime = _poolManager.Settings._pooledConnectionLifetime;
@@ -287,15 +287,27 @@ namespace System.Net.Http
                 CachedConnection cachedConnection;
                 lock (SyncObj)
                 {
-                    ServiceAuthority authority = desiredAuthority ?? _authority;
-                    if (authority.IsTakingRequests && authority.TryGetIdleHttp11Connection(out cachedConnection))
+                    ServiceAuthority authority;
+                    if (desiredAuthority != null)
+                    {
+                        authority = desiredAuthority;
+                        if (!authority.TryGetIdleHttp11Connection(out cachedConnection))
+                        {
+                            // The desired authority has no idle connections.
+                        }
+                    }
+                    if (desiredAuthority == null && (authority = _authority).IsTakingRequests && authority.TryGetIdleHttp11Connection(out cachedConnection))
                     {
                         // We have a cached connection that we can attempt to use.
                         // Test it below outside the lock, to avoid doing expensive validation while holding the lock.
                     }
+                    else if (desiredAuthority != null)
+                    {
+                    }
                     else if (authority != desiredAuthority && (authority = authority.PreviousAuthority) != null && authority.IsTakingRequests && authority.TryGetIdleHttp11Connection(out cachedConnection))
                     {
                         // The current authority has no idle connections. Use the previous authority to avoid waiting.
+                        authority.IncrementActiveRequestCount();
 
                         if (_associatedConnectionCount < _maxConnections)
                         {
@@ -332,28 +344,47 @@ namespace System.Net.Http
                         // current for that endpoint, if there is one.
                     }
 
-                    // If desiredAuthority is set, the connection is already reserved. Otherwise, reserve it here
-                    // to prevent the authority from being disposed.
+                    // If desiredAuthority is set, the connection is already reserved. Otherwise,
+                    // reserve it here to prevent the authority from being disposed.
                     if (authority != desiredAuthority)
                     {
-                        authority.IncrementActiveRequestCount();
+                        authority.TryIncrementActiveRequestCount();
                     }
                 }
 
                 HttpConnection conn = cachedConnection._connection;
-                if (!conn.LifetimeExpired(nowTicks, pooledConnectionLifetime) &&
-                    !conn.EnsureReadAheadAndPollRead())
+                if (conn != null)
                 {
-                    // We found a valid connection.  Return it.
-                    if (NetEventSource.IsEnabled) conn.Trace("Found usable connection in pool.");
-                    return new ValueTask<HttpConnection>(conn);
+                    try
+                    {
+                        if (!conn.LifetimeExpired(nowTicks, pooledConnectionLifetime) &&
+                            !conn.EnsureReadAheadAndPollRead())
+                        {
+                            // We found a valid connection.  Return it.
+                            if (NetEventSource.IsEnabled) conn.Trace("Found usable connection in pool.");
+                            return new ValueTask<HttpConnection>(conn);
+                        }
+
+                        // We got a connection, but it was already closed by the server or the
+                        // server sent unexpected data or the connection is too old.  In any case,
+                        // we can't use the connection, so get rid of it and loop around to try again.
+                        if (NetEventSource.IsEnabled) conn.Trace("Found invalid connection in pool.");
+                        conn.Dispose();
+
+                        if (conn.ServiceAuthority != desiredAuthority)
+                        {
+                            conn.ServiceAuthority.DecrementActiveRequestCount();
+                        }
+                    }
+                    catch
+                    {
+                        if (conn.ServiceAuthority != desiredAuthority)
+                        {
+                            conn.ServiceAuthority.DecrementActiveRequestCount();
+                        }
+                    }
                 }
 
-                // We got a connection, but it was already closed by the server or the
-                // server sent unexpected data or the connection is too old.  In any case,
-                // we can't use the connection, so get rid of it and loop around to try again.
-                if (NetEventSource.IsEnabled) conn.Trace("Found invalid connection in pool.");
-                conn.Dispose();
             }
 
             // We are at the connection limit. Wait for an available connection or connection count (indicated by null).
