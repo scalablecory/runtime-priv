@@ -436,7 +436,7 @@ namespace System.Net.Http
                         headerValues.Add((AltSvcHeaderValue)parsedValue);
                     }
 
-                    _pool.HandleAltSvc(headerValues);
+                    _pool.HandleAltSvc(headerValues, null);
                 }
             }
 

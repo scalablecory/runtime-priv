@@ -8,6 +8,7 @@ using System.Globalization;
 using System.IO;
 using System.Net.Http.Headers;
 using System.Net.Http.HPack;
+using System.Net.Quic;
 using System.Net.Security;
 using System.Net.Sockets;
 using System.Runtime.CompilerServices;
@@ -65,11 +66,16 @@ namespace System.Net.Http
         private SemaphoreSlim _http2ConnectionCreateLock;
         private byte[] _http2AltSvcOriginUri;
 
+        private readonly bool _http3Enabled;
+        private Http3Connection _http3Connection;
+        private SemaphoreSlim _http3ConnectionCreateLock;
+
         /// <summary>For non-proxy connection pools, this is the host name in bytes; for proxies, null.</summary>
         private readonly byte[] _hostHeaderValueBytes;
         /// <summary>Options specialized and cached for this pool and its key.</summary>
         private readonly SslClientAuthenticationOptions _sslOptionsHttp11;
         private readonly SslClientAuthenticationOptions _sslOptionsHttp2;
+        private readonly SslClientAuthenticationOptions _sslOptionsHttp3;
 
         /// <summary>Queue of waiters waiting for a connection.  Created on demand.</summary>
         private Queue<TaskCompletionSourceWithCancellation<HttpConnection>> _waiters;
@@ -99,7 +105,8 @@ namespace System.Net.Http
                 _http3Authority = _originAuthority;
             }
 
-            _http2Enabled = (_poolManager.Settings._maxHttpVersion == HttpVersion.Version20);
+            _http2Enabled = _poolManager.Settings._maxHttpVersion >= HttpVersion.Version20;
+            _http3Enabled = _poolManager.Settings._maxHttpVersion >= HttpVersion.Version30;
 
             switch (kind)
             {
@@ -109,6 +116,7 @@ namespace System.Net.Http
                     Debug.Assert(sslHostName == null);
                     Debug.Assert(proxyUri == null);
                     _http2Enabled = _poolManager.Settings._allowUnencryptedHttp2;
+                    _http3Enabled = false;
                     break;
 
                 case HttpConnectionKind.Https:
@@ -125,6 +133,7 @@ namespace System.Net.Http
                     Debug.Assert(proxyUri != null);
 
                     _http2Enabled = false;
+                    _http3Enabled = false;
                     break;
 
                 case HttpConnectionKind.ProxyTunnel:
@@ -134,6 +143,7 @@ namespace System.Net.Http
                     Debug.Assert(proxyUri != null);
 
                     _http2Enabled = false;
+                    _http3Enabled = false;
                     break;
 
                 case HttpConnectionKind.SslProxyTunnel:
@@ -141,6 +151,7 @@ namespace System.Net.Http
                     Debug.Assert(port != 0);
                     Debug.Assert(sslHostName != null);
                     Debug.Assert(proxyUri != null);
+                    _http3Enabled = false; // TODO: how do we tunnel HTTP3?
                     break;
 
                 case HttpConnectionKind.ProxyConnect:
@@ -150,6 +161,7 @@ namespace System.Net.Http
                     Debug.Assert(proxyUri != null);
 
                     _http2Enabled = false;
+                    _http3Enabled = false;
                     break;
 
                 default:
@@ -184,7 +196,7 @@ namespace System.Net.Http
                 if (_http2Enabled)
                 {
                     _sslOptionsHttp2 = ConstructSslOptions(poolManager, sslHostName);
-                    _sslOptionsHttp2.ApplicationProtocols = Http2ApplicationProtocols;
+                    _sslOptionsHttp2.ApplicationProtocols = s_http2ApplicationProtocols;
 
                     // Note:
                     // The HTTP/2 specification states:
@@ -203,6 +215,12 @@ namespace System.Net.Http
                     Debug.Assert(hostHeader != null);
                     _encodedAuthorityHostHeader = HPackEncoder.EncodeLiteralHeaderFieldWithoutIndexingToAllocatedArray(StaticTable.Authority, hostHeader);
                 }
+
+                if (_http3Enabled)
+                {
+                    _sslOptionsHttp3 = ConstructSslOptions(poolManager, sslHostName);
+                    _sslOptionsHttp3.ApplicationProtocols = s_http3ApplicationProtocols;
+                }
             }
 
             // Set up for PreAuthenticate.  Access to this cache is guarded by a lock on the cache itself.
@@ -214,7 +232,8 @@ namespace System.Net.Http
             if (NetEventSource.IsEnabled) Trace($"{this}");
         }
 
-        private static readonly List<SslApplicationProtocol> Http2ApplicationProtocols = new List<SslApplicationProtocol>() { SslApplicationProtocol.Http2, SslApplicationProtocol.Http11 };
+        private static readonly List<SslApplicationProtocol> s_http3ApplicationProtocols = new List<SslApplicationProtocol>() { SslApplicationProtocol.Http3 };
+        private static readonly List<SslApplicationProtocol> s_http2ApplicationProtocols = new List<SslApplicationProtocol>() { SslApplicationProtocol.Http2, SslApplicationProtocol.Http11 };
 
         private static SslClientAuthenticationOptions ConstructSslOptions(HttpConnectionPoolManager poolManager, string sslHostName)
         {
@@ -252,15 +271,18 @@ namespace System.Net.Http
         public byte[] HostHeaderValueBytes => _hostHeaderValueBytes;
         public CredentialCache PreAuthCredentials { get; }
 
+        /// <summary>
+        /// An ASCII origin string per RFC 6454 Section 6.2, in format &lt;scheme&gt;://&lt;host&gt;[:&lt;port&gt;]
+        /// </summary>
+        /// <remarks>
+        /// Used by <see cref="Http2Connection"/> to test ALTSVC frames for our origin.
+        /// </remarks>
         public byte[] Http2AltSvcOriginUri
         {
             get
             {
                 if (_http2AltSvcOriginUri == null)
                 {
-                    // This builds an ASCII origin string per RFC 6454 Section 6.2
-                    // <scheme>://<host>[:<port>]
-
                     var sb = new StringBuilder();
 
                     sb
@@ -287,6 +309,16 @@ namespace System.Net.Http
         private ValueTask<(HttpConnectionBase connection, bool isNewConnection, HttpResponseMessage failureResponse)>
             GetConnectionAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
+            // TODO: this may not be the best way to check if H3 connection is open yet.
+            if (_http3Enabled && request.Version.Major >= 3)
+            {
+                HttpAuthority authority = _http3Authority;
+                if (authority != null)
+                {
+                    return GetHttp3ConnectionAsync(request, authority, cancellationToken);
+                }
+            }
+
             if (_http2Enabled && request.Version.Major >= 2)
             {
                 return GetHttp2ConnectionAsync(request, cancellationToken);
@@ -574,6 +606,88 @@ namespace System.Net.Http
             return await GetHttpConnectionAsync(request, cancellationToken).ConfigureAwait(false);
         }
 
+        private async ValueTask<(HttpConnectionBase connection, bool isNewConnection, HttpResponseMessage failureResponse)>
+            GetHttp3ConnectionAsync(HttpRequestMessage request, HttpAuthority authority, CancellationToken cancellationToken)
+        {
+            Debug.Assert(_kind == HttpConnectionKind.Https);
+            Debug.Assert(_http3Enabled == true);
+
+            Http3Connection http3Connection = _http3Connection;
+
+            if (http3Connection != null)
+            {
+                TimeSpan pooledConnectionLifetime = _poolManager.Settings._pooledConnectionLifetime;
+                if (http3Connection.LifetimeExpired(Environment.TickCount64, pooledConnectionLifetime) && http3Connection.Authority == _http3Authority)
+                {
+                    // Connection expired.
+                    await http3Connection.DisposeAsync();
+                    InvalidateHttp3Connection(http3Connection);
+                }
+                else
+                {
+                    // Connection exist and it is still good to use.
+                    if (NetEventSource.IsEnabled) Trace("Using existing HTTP3 connection.");
+                    _usedSinceLastCleanup = true;
+                    return (http3Connection, false, null);
+                }
+            }
+
+            // Ensure that the connection creation semaphore is created
+            if (_http3ConnectionCreateLock == null)
+            {
+                lock (SyncObj)
+                {
+                    if (_http3ConnectionCreateLock == null)
+                    {
+                        _http3ConnectionCreateLock = new SemaphoreSlim(1);
+                    }
+                }
+            }
+
+            await _http3ConnectionCreateLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                if (_http3Connection != null)
+                {
+                    // Someone beat us to it
+
+                    if (NetEventSource.IsEnabled)
+                    {
+                        Trace("Using existing HTTP3 connection.");
+                    }
+
+                    return (_http3Connection, false, null);
+                }
+
+                if (NetEventSource.IsEnabled)
+                {
+                    Trace("Attempting new HTTP3 connection.");
+                }
+
+                QuicConnection quicConnection = await ConnectHelper.ConnectQuicAsync(authority.IdnHost, authority.Port, _sslOptionsHttp3, cancellationToken);
+
+                if (quicConnection.NegotiatedApplicationProtocol != SslApplicationProtocol.Http3)
+                {
+                    HandleBadAltSvc(authority);
+                    throw new HttpRequestException("QUIC connected but no HTTP/3 indicated via ALPN.", null, RequestRetryType.RetryOnSameOrNextProxy);
+                }
+
+                http3Connection = new Http3Connection(_originAuthority, authority, quicConnection);
+                _http3Connection = http3Connection;
+
+                if (NetEventSource.IsEnabled)
+                {
+                    Trace("New HTTP3 connection established.");
+                }
+
+                return (http3Connection, true, null);
+            }
+            finally
+            {
+                _http3ConnectionCreateLock.Release();
+            }
+        }
+
         public async Task<HttpResponseMessage> SendWithRetryAsync(HttpRequestMessage request, bool doRequestAuth, CancellationToken cancellationToken)
         {
             while (true)
@@ -615,16 +729,16 @@ namespace System.Net.Http
 
                 if (_altSvcEnabled && response.Headers.AltSvc.Count != 0)
                 {
-                    HandleAltSvc(response.Headers.AltSvc);
+                    HandleAltSvc(response.Headers.AltSvc, response.Headers.Age);
                 }
 
                 // If an Alt-Svc authority returns 421, it means it can't actually handle the request.
                 // An authority is supposed to be able to handle ALL requests to the origin, so this is a server bug.
                 // In this case, we blacklist the authority and retry the request at the origin.
-                if (response.StatusCode == HttpStatusCode.MisdirectedRequest && connection.Authority != _originAuthority)
+                if (response.StatusCode == HttpStatusCode.MisdirectedRequest && connection is Http3Connection h3Connection && h3Connection.Authority != _originAuthority)
                 {
                     response.Dispose();
-                    HandleBadAltSvc(connection.Authority);
+                    HandleBadAltSvc(h3Connection.Authority);
                     continue;
                 }
 
@@ -1100,6 +1214,17 @@ namespace System.Net.Http
                 if (_http2Connection == connection)
                 {
                     _http2Connection = null;
+                }
+            }
+        }
+
+        public void InvalidateHttp3Connection(Http3Connection connection)
+        {
+            lock (SyncObj)
+            {
+                if (_http3Connection == connection)
+                {
+                    _http3Connection = null;
                 }
             }
         }
