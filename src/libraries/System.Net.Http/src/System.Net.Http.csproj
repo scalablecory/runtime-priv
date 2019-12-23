@@ -207,6 +207,63 @@
     <Compile Include="$(CommonPath)System\Net\Http\Http2\Hpack\StatusCodes.cs">
       <Link>Common\System\Net\Http\Http2\Hpack\StatusCodes.cs</Link>
     </Compile>
+    <Compile Include="$(CommonPath)System\Net\Http\Http3\Http3FrameReader.cs">
+      <Link>Common\System\Net\Http\Http3\Http3FrameReader.cs</Link>
+    </Compile>
+    <Compile Include="$(CommonPath)System\Net\Http\Http3\Http3FrameWriter.cs">
+      <Link>Common\System\Net\Http\Http3\Http3FrameWriter.cs</Link>
+    </Compile>
+    <Compile Include="$(CommonPath)System\Net\Http\Http3\Helpers\VariableLengthIntegerHelper.cs">
+      <Link>Common\System\Net\Http\Http3\Helpers\VariableLengthIntegerHelper.cs</Link>
+    </Compile>
+    <Compile Include="$(CommonPath)System\Net\Http\Http3\Frames\Http3ErrorCode.cs">
+      <Link>Common\System\Net\Http\Http3\Frames\Http3ErrorCode.cs</Link>
+    </Compile>
+    <Compile Include="$(CommonPath)System\Net\Http\Http3\Frames\Http3Frame.cs">
+      <Link>Common\System\Net\Http\Http3\Frames\Http3Frame.cs</Link>
+    </Compile>
+    <Compile Include="$(CommonPath)System\Net\Http\Http3\Frames\Http3Frame.Data.cs">
+      <Link>Common\System\Net\Http\Http3\Frames\Http3Frame.Data.cs</Link>
+    </Compile>
+    <Compile Include="$(CommonPath)System\Net\Http\Http3\Frames\Http3Frame.GoAway.cs">
+      <Link>Common\System\Net\Http\Http3\Frames\Http3Frame.GoAway.cs</Link>
+    </Compile>
+    <Compile Include="$(CommonPath)System\Net\Http\Http3\Frames\Http3Frame.Headers.cs">
+      <Link>Common\System\Net\Http\Http3\Frames\Http3Frame.Headers.cs</Link>
+    </Compile>
+    <Compile Include="$(CommonPath)System\Net\Http\Http3\Frames\Http3Frame.Settings.cs">
+      <Link>Common\System\Net\Http\Http3\Frames\Http3Frame.Settings.cs</Link>
+    </Compile>
+    <Compile Include="$(CommonPath)System\Net\Http\Http3\Frames\Http3FrameType.cs">
+      <Link>Common\System\Net\Http\Http3\Frames\Http3FrameType.cs</Link>
+    </Compile>
+    <Compile Include="$(CommonPath)System\Net\Http\Http3\QPack\DecoderStreamReader.cs">
+      <Link>Common\System\Net\Http\Http3\QPack\DecoderStreamReader.cs</Link>
+    </Compile>
+    <Compile Include="$(CommonPath)System\Net\Http\Http3\QPack\DynamicTable.cs">
+      <Link>Common\System\Net\Http\Http3\QPack\DynamicTable.cs</Link>
+    </Compile>
+    <Compile Include="$(CommonPath)System\Net\Http\Http3\QPack\EncoderStreamReader.cs">
+      <Link>Common\System\Net\Http\Http3\QPack\EncoderStreamReader.cs</Link>
+    </Compile>
+    <Compile Include="$(CommonPath)System\Net\Http\Http3\QPack\HeaderField.cs">
+      <Link>Common\System\Net\Http\Http3\QPack\HeaderField.cs</Link>
+    </Compile>
+    <Compile Include="$(CommonPath)System\Net\Http\Http3\QPack\QPackDecoder.cs">
+      <Link>Common\System\Net\Http\Http3\QPack\QPackDecoder.cs</Link>
+    </Compile>
+    <Compile Include="$(CommonPath)System\Net\Http\Http3\QPack\QPackDecodingException.cs">
+      <Link>Common\System\Net\Http\Http3\QPack\QPackDecodingException.cs</Link>
+    </Compile>
+    <Compile Include="$(CommonPath)System\Net\Http\Http3\QPack\QPackEncoder.cs">
+      <Link>Common\System\Net\Http\Http3\QPack\QPackEncoder.cs</Link>
+    </Compile>
+    <Compile Include="$(CommonPath)System\Net\Http\Http3\QPack\QPackEncodingException.cs">
+      <Link>Common\System\Net\Http\Http3\QPack\QPackEncodingException.cs</Link>
+    </Compile>
+    <Compile Include="$(CommonPath)System\Net\Http\Http3\QPack\StaticTable.cs">
+      <Link>Common\System\Net\Http\Http3\QPack\StaticTable.cs</Link>
+    </Compile>
     <Compile Include="$(CommonPath)System\Net\SecurityStatusPal.cs">
       <Link>Common\System\Net\SecurityStatusPal.cs</Link>
     </Compile>
