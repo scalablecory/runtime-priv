@@ -14,21 +14,25 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3
     /// </summary>
     internal static class VariableLengthIntegerHelper
     {
-        private const int TwoByteSubtract = 0x4000;
+        private const byte LengthMask = 0xC0;
+        private const byte LengthOneByte = 0x00;
+        private const byte LengthTwoByte = 0x40;
+        private const byte LengthFourByte = 0x80;
+        private const byte LengthEightByte = 0xC0;
+
+        private const uint TwoByteSubtract = 0x4000;
         private const uint FourByteSubtract = 0x80000000;
         private const ulong EightByteSubtract = 0xC000000000000000;
-        private const int OneByteLimit = 64;
-        private const int TwoByteLimit = 16383;
-        private const int FourByteLimit = 1073741823;
 
-        public static long GetInteger(in ReadOnlySequence<byte> buffer, out SequencePosition consumed, out SequencePosition examined)
+        private const uint OneByteLimit = 64;
+        private const uint TwoByteLimit = 16383;
+        private const uint FourByteLimit = 1073741823;
+
+        public static bool TryRead(ReadOnlySpan<byte> buffer, out long value, out int bytesRead)
         {
-            consumed = buffer.Start;
-            examined = buffer.End;
-
             if (buffer.Length == 0)
             {
-                return -1;
+                goto needMore;
             }
 
             // The first two bits of the first byte represent the length of the
@@ -38,53 +42,130 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3
             // 10 = length 4
             // 11 = length 8
 
-            var span = buffer.Slice(0, Math.Min(buffer.Length, 8)).ToSpan();
+            byte firstByte = buffer[0];
 
-            var firstByte = span[0];
-
-            if ((firstByte & 0xC0) == 0)
+            switch (firstByte & LengthMask)
             {
-                consumed = examined = buffer.GetPosition(1);
-                return firstByte & 0x3F;
+                case LengthOneByte:
+                    value = firstByte;
+                    bytesRead = 1;
+                    return true;
+                case LengthTwoByte:
+                    if (buffer.Length < 2)
+                    {
+                        goto needMore;
+                    }
+                    value = BinaryPrimitives.ReadUInt16BigEndian(buffer) - TwoByteSubtract;
+                    bytesRead = 2;
+                    return true;
+                case LengthFourByte:
+                    if (buffer.Length < 4)
+                    {
+                        goto needMore;
+                    }
+                    value = BinaryPrimitives.ReadUInt32BigEndian(buffer) - FourByteSubtract;
+                    bytesRead = 4;
+                    return true;
+                default:
+                    Debug.Assert((firstByte & LengthMask) == LengthEightByte);
+
+                    if (buffer.Length < 8)
+                    {
+                        goto needMore;
+                    }
+                    value = (long)(BinaryPrimitives.ReadUInt64BigEndian(buffer) - EightByteSubtract);
+                    bytesRead = 4;
+                    return true;
             }
-            else if ((firstByte & 0xC0) == 0x40)
+
+        needMore:
+            value = 0;
+            bytesRead = 0;
+            return false;
+        }
+
+        public static bool TryRead(ref SequenceReader<byte> reader, out long value)
+        {
+            ReadOnlySpan<byte> span = reader.UnreadSpan;
+
+            if (span.Length >= 8)
             {
-                if (span.Length < 2)
+                // Hot path: call span-based read immediately.
+                if (TryRead(span, out value, out int bytesRead))
                 {
-                    return -1;
+                    reader.Advance(bytesRead);
+                    return true;
+                }
+                else
+                {
+                    return false;
+                }
+            }
+
+            // Cold path: copy to a temporary buffer before calling span-based read.
+            return TryReadSlow(ref reader, out value);
+
+            static bool TryReadSlow(ref SequenceReader<byte> reader, out long value)
+            {
+                ReadOnlySpan<byte> span = reader.CurrentSpan;
+
+                if (!reader.TryPeek(out byte firstByte))
+                {
+                    value = 0;
+                    return false;
                 }
 
-                consumed = examined = buffer.GetPosition(2);
+                int length =
+                    (firstByte & LengthMask) switch
+                    {
+                        LengthOneByte => 1,
+                        LengthTwoByte => 2,
+                        LengthFourByte => 4,
+                        _ => 8
+                    };
 
-                return BinaryPrimitives.ReadUInt16BigEndian(span) - TwoByteSubtract;
-            }
-            else if ((firstByte & 0xC0) == 0x80)
-            {
-                if (span.Length < 4)
+                Span<byte> temp = stackalloc byte[length];
+                if (reader.TryCopyTo(temp))
                 {
-                    return -1;
+                    bool result = TryRead(temp, out value, out int bytesRead);
+                    Debug.Assert(result == true);
+                    Debug.Assert(bytesRead == length);
+
+                    reader.Advance(bytesRead);
+                    return true;
                 }
 
-                consumed = examined = buffer.GetPosition(4);
+                value = 0;
+                return false;
+            }
+        }
 
-                return BinaryPrimitives.ReadUInt32BigEndian(span) - FourByteSubtract;
+        public static long GetInteger(in ReadOnlySequence<byte> buffer, out SequencePosition consumed, out SequencePosition examined)
+        {
+            var reader = new SequenceReader<byte>(buffer);
+            if (TryRead(ref reader, out long value))
+            {
+                consumed = examined = buffer.GetPosition(reader.Consumed);
+                return (long)value;
             }
             else
             {
-                if (span.Length < 8)
-                {
-                    return -1;
-                }
-
-                consumed = examined = buffer.GetPosition(8);
-
-                return (long)(BinaryPrimitives.ReadUInt64BigEndian(span) - EightByteSubtract);
+                consumed = default;
+                examined = buffer.End;
+                return -1;
             }
+        }
+
+        public static int WriteInteger(Span<byte> buffer, int longToEncode)
+        {
+            Debug.Assert(longToEncode > 0);
+            return WriteInteger(buffer, longToEncode);
         }
 
         public static int WriteInteger(Span<byte> buffer, long longToEncode)
         {
             Debug.Assert(buffer.Length >= 8);
+            Debug.Assert(longToEncode >= 0);
             Debug.Assert(longToEncode < long.MaxValue / 2);
 
             if (longToEncode < OneByteLimit)
@@ -95,21 +176,32 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3
             else if (longToEncode < TwoByteLimit)
             {
                 BinaryPrimitives.WriteUInt16BigEndian(buffer, (ushort)longToEncode);
-                buffer[0] += 0x40;
+                buffer[0] |= 0x40;
                 return 2;
             }
             else if (longToEncode < FourByteLimit)
             {
                 BinaryPrimitives.WriteUInt32BigEndian(buffer, (uint)longToEncode);
-                buffer[0] += 0x80;
+                buffer[0] |= 0x80;
                 return 4;
             }
             else
             {
                 BinaryPrimitives.WriteUInt64BigEndian(buffer, (ulong)longToEncode);
-                buffer[0] += 0xC0;
+                buffer[0] |= 0xC0;
                 return 8;
             }
+        }
+
+        public static int GetByteCount(ulong value)
+        {
+            Debug.Assert(value <= ulong.MaxValue / 4);
+
+            return
+                value < OneByteLimit ? 1 :
+                value < TwoByteLimit ? 2 :
+                value < FourByteLimit ? 4 :
+                8;
         }
     }
 }

@@ -3,7 +3,7 @@
 
 namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3
 {
-    internal enum Http3FrameType
+    internal enum Http3FrameType : long
     {
         Data = 0x0,
         Headers = 0x1,

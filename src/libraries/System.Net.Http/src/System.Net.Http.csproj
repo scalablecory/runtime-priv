@@ -207,11 +207,14 @@
     <Compile Include="$(CommonPath)System\Net\Http\Http2\Hpack\StatusCodes.cs">
       <Link>Common\System\Net\Http\Http2\Hpack\StatusCodes.cs</Link>
     </Compile>
-    <Compile Include="$(CommonPath)System\Net\Http\Http3\Http3FrameReader.cs">
-      <Link>Common\System\Net\Http\Http3\Http3FrameReader.cs</Link>
-    </Compile>
     <Compile Include="$(CommonPath)System\Net\Http\Http3\Http3FrameWriter.cs">
       <Link>Common\System\Net\Http\Http3\Http3FrameWriter.cs</Link>
+    </Compile>
+    <Compile Include="$(CommonPath)System\Net\Http\Http3\Http3SettingType.cs">
+      <Link>Common\System\Net\Http\Http3\Http3SettingType.cs</Link>
+    </Compile>
+    <Compile Include="$(CommonPath)System\Net\Http\Http3\Http3StreamType.cs">
+      <Link>Common\System\Net\Http\Http3\Http3StreamType.cs</Link>
     </Compile>
     <Compile Include="$(CommonPath)System\Net\Http\Http3\Helpers\VariableLengthIntegerHelper.cs">
       <Link>Common\System\Net\Http\Http3\Helpers\VariableLengthIntegerHelper.cs</Link>

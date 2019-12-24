@@ -18,7 +18,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3
             |                       Frame Payload (*)                     ...
             +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
         */
-        internal static bool TryReadFrame(ref ReadOnlySequence<byte> readableBuffer, Http3Frame frame, uint maxFrameSize, out ReadOnlySequence<byte> framePayload)
+        public static bool TryReadFrame(ref ReadOnlySequence<byte> readableBuffer, Http3Frame frame, uint maxFrameSize, out ReadOnlySequence<byte> framePayload)
         {
             framePayload = ReadOnlySequence<byte>.Empty;
             var consumed = readableBuffer.Start;
