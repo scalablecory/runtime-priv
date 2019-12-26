@@ -158,5 +158,13 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3.QPack
 
         private static HeaderField CreateHeaderField(string name, string value)
             => new HeaderField(Encoding.ASCII.GetBytes(name), Encoding.ASCII.GetBytes(value));
+
+        public const int MethodConnect = 15;
+        public const int MethodDelete = 16;
+        public const int MethodGet = 17;
+        public const int MethodHead = 18;
+        public const int MethodOptions = 19;
+        public const int MethodPost = 20;
+        public const int MethodPut = 21;
     }
 }

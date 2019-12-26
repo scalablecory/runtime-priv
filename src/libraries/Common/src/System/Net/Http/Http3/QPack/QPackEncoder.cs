@@ -35,14 +35,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3.QPack
             return IntegerEncoder.Encode(index, 6, destination, out bytesWritten);
         }
 
-        public static bool EncodeIndexHeaderFieldWithPostBaseIndex(int index, Span<byte> destination, out int bytesWritten)
-        {
-            bytesWritten = 0;
-            return false;
-        }
-
-        /// <summary>Encodes a "Literal Header Field without Indexing".</summary>
-        public static bool EncodeLiteralHeaderFieldWithNameReference(int index, string value, Span<byte> destination, out int bytesWritten)
+        public static bool EncodeStaticIndexedHeaderField(int index, Span<byte> destination, out int bytesWritten)
         {
             if (destination.IsEmpty)
             {
@@ -50,10 +43,61 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3.QPack
                 return false;
             }
 
-            EncodeHeaderBlockPrefix(destination, out bytesWritten);
-            destination = destination.Slice(bytesWritten);
-
+            destination[0] = 0b11000000;
             return IntegerEncoder.Encode(index, 6, destination, out bytesWritten);
+        }
+
+        public static byte[] EncodeStaticIndexedHeaderFieldToNewArray(int index)
+        {
+            Span<byte> buffer = stackalloc byte[16];
+
+            bool res = EncodeStaticIndexedHeaderField(index, buffer, out int bytesWritten);
+            Debug.Assert(res == true);
+
+            return buffer.ToArray();
+        }
+
+        public static bool EncodeIndexHeaderFieldWithPostBaseIndex(int index, Span<byte> destination, out int bytesWritten)
+        {
+            bytesWritten = 0;
+            return false;
+        }
+
+        public static bool EncodeLiteralHeaderFieldWithStaticNameReference(int index, string value, Span<byte> destination, out int bytesWritten)
+        {
+            if (destination.Length < 2)
+            {
+                // Requires at least two bytes (one for name reference header, one for value length)
+                bytesWritten = 0;
+                return false;
+            }
+
+            destination[0] = 0b01110000;
+            if (!IntegerEncoder.Encode(index, 4, destination, out int headerBytesWritten))
+            {
+                bytesWritten = 0;
+                return false;
+            }
+
+            destination = destination.Slice(headerBytesWritten);
+
+            if (!EncodeValueString(value, destination, out int valueBytesWritten))
+            {
+                bytesWritten = 0;
+                return false;
+            }
+
+            bytesWritten = headerBytesWritten + valueBytesWritten;
+            return true;
+        }
+
+        public static byte[] EncodeLiteralHeaderFieldWithStaticNameReferenceToArray(int index, string value)
+        {
+            //TODO: find actual values for these lengths and make them constants.
+            Span<byte> temp = value.Length < 256 ? stackalloc byte[256 + 8] : new byte[value.Length + 16];
+            bool res = EncodeLiteralHeaderFieldWithStaticNameReference(index, value, temp, out int bytesWritten);
+            Debug.Assert(res == true);
+            return temp.Slice(bytesWritten).ToArray();
         }
 
         /*
@@ -355,7 +399,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3.QPack
 
             do
             {
-                if (!EncodeHeader(_enumerator.Current.Key, _enumerator.Current.Value, buffer.Slice(length), out var headerLength))
+                if (!EncodeLiteralValueWithoutNameReference(_enumerator.Current.Key, _enumerator.Current.Value, buffer.Slice(length), out var headerLength))
                 {
                     if (length == 0 && throwIfNoneEncoded)
                     {
@@ -370,7 +414,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3.QPack
             return true;
         }
 
-        private bool EncodeHeader(string name, string value, Span<byte> buffer, out int length)
+        public static bool EncodeLiteralValueWithoutNameReference(string name, string value, Span<byte> buffer, out int length)
         {
             var i = 0;
             length = 0;
@@ -392,7 +436,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3.QPack
                 return false;
             }
 
-            if (!EncodeValueString(value, buffer.Slice(i), out var valueLength, lowercase: false))
+            if (!EncodeValueString(value, buffer.Slice(i), out var valueLength))
             {
                 return false;
             }
@@ -403,10 +447,8 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3.QPack
             return true;
         }
 
-        private bool EncodeValueString(string s, Span<byte> buffer, out int length, bool lowercase)
+        private static bool EncodeValueString(string s, Span<byte> buffer, out int length)
         {
-            const int toLowerMask = 0x20;
-
             var i = 0;
             length = 0;
 
@@ -432,14 +474,14 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3.QPack
                     return false;
                 }
 
-                buffer[i++] = (byte)(s[j] | (lowercase && s[j] >= (byte)'A' && s[j] <= (byte)'Z' ? toLowerMask : 0));
+                buffer[i++] = (byte)s[j];
             }
 
             length = i;
             return true;
         }
 
-        private bool EncodeNameString(string s, Span<byte> buffer, out int length, bool lowercase)
+        private static bool EncodeNameString(string s, Span<byte> buffer, out int length, bool lowercase)
         {
             const int toLowerMask = 0x20;
 

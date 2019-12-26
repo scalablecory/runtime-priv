@@ -27,6 +27,7 @@ namespace System.Net.Http
         private readonly HttpAuthority _authority;
         private readonly QuicConnection _connection;
 
+        // Used to tear down background tasks.
         private CancellationTokenSource _cancellationSource = new CancellationTokenSource();
 
         // Our control stream.
@@ -35,8 +36,10 @@ namespace System.Net.Http
         // Current SETTINGS from the server.
         private int _maximumHeadersLength = -1;
 
-        // Once the server's control stream is received, this is set to 1. Further control streams will result in a connection error.
+        // Once the server's streams are received, these are set to 1. Further receipt of these streams results in a connection error.
         private int _haveServerControlStream = 0;
+        private int _haveServerQpackDecodeStream = 0;
+        private int _haveServerQpackEncodeStream = 0;
 
         public HttpAuthority Authority => _authority;
 
@@ -63,9 +66,40 @@ namespace System.Net.Http
             throw new NotImplementedException();
         }
 
-        public override void Trace(string message, [CallerMemberName] string memberName = null)
+        private ArrayBuffer WriteHeaders(HttpRequestMessage request)
         {
+            var buffer = new ArrayBuffer(initialSize: 64, usePool: true);
+
+            // Reserve space for frame type + payload length + header block prefix.
+            // Payload length here is assumed to fit within 4 bytes.
+            // These values will be written after headers are serialized, as the variable-length payload is an int.
+            buffer.Commit(1 + 4 + 2);
+
+            HttpMethod normalizedMethod = HttpMethod.Normalize(request.Method);
+
+            if (normalizedMethod.Http3EncodedBytes != null)
+            {
+                buffer.EnsureAvailableSpace(normalizedMethod.Http3EncodedBytes.Length);
+                normalizedMethod.Http3EncodedBytes.CopyTo(buffer.AvailableSpan);
+                buffer.Commit()
+            }
         }
+
+        private async ValueTask WriteBytesAsync(ReadOnlyMemory<byte> memory, CancellationToken cancellationToken)
+        {
+
+        }
+
+        public override void Trace(string message, [CallerMemberName] string memberName = null) =>
+            Trace(0, message, memberName);
+
+        internal void Trace(int streamId, string message, [CallerMemberName] string memberName = null) =>
+            NetEventSource.Log.HandlerMessage(
+                _pool?.GetHashCode() ?? 0,    // pool ID
+                GetHashCode(),                // connection ID
+                streamId,                     // stream ID
+                memberName,                   // method name
+                message);                     // message
 
         private async ValueTask SendSettingsAsync()
         {
@@ -87,40 +121,131 @@ namespace System.Net.Http
             while (true)
             {
                 QuicStream stream = await _connection.AcceptStreamAsync(_cancellationSource.Token).ConfigureAwait(false);
-                _ = ProcessServerControlStreamAsync(stream);
+                _ = ProcessServerStream(stream);
             }
         }
 
-        private async Task ProcessServerControlStreamAsync(QuicStream stream)
+        private async Task ProcessServerStream(QuicStream stream)
         {
-            var buffer = new ArrayBuffer(512);
+            var buffer = new ArrayBuffer(initialSize: 32, usePool: true);
 
-            using (stream)
+            try
             {
-                // Do an initial read so we can check our stream type.
+                if (stream.CanWrite)
+                {
+                    if (NetEventSource.IsEnabled)
+                    {
+                        NetEventSource.Error(this, "Server initiated bidirectional stream received without prior negotiation.");
+                    }
+
+                    stream.Close(); // TODO: abort the connection with H3_STREAM_CREATION_ERROR.
+                    return;
+                }
 
                 int bytesRead = await stream.ReadAsync(buffer.AvailableMemory, _cancellationSource.Token).ConfigureAwait(false);
 
                 if (bytesRead == 0)
                 {
-                    throw new HttpRequestException($"Stream closed prematurely, expected stream type identifier.");
-                }
+                    if (NetEventSource.IsEnabled)
+                    {
+                        NetEventSource.Error(this, "Server initiated stream received, but got EOF before stream type.");
+                    }
 
-                buffer.Commit(bytesRead);
-
-                if (buffer.ActiveSpan[0] != 0x00)
-                {
-                    // Anything other than a unidirectional control stream (stream type identifier 0x00) is an unsupported stream type.
                     stream.Close(); // TODO: abort the stream with H3_STREAM_CREATION_ERROR.
                     return;
                 }
 
-                if (Interlocked.Exchange(ref _haveServerControlStream, 1) != 0)
+                buffer.Commit(bytesRead);
+
+                // Stream type is a variable-length integer, but we only check the first byte. There is no known type requiring more than 1 byte.
+                switch (buffer.ActiveSpan[0])
                 {
-                    // A second control stream has been received.
-                    _connection.Close(); // TODO: abort the connection with H3_STREAM_CREATION_ERROR.
+                    case (byte)Http3StreamType.Control:
+                        if (Interlocked.Exchange(ref _haveServerControlStream, 1) != 0)
+                        {
+                            // A second control stream has been received.
+                            _connection.Close(); // TODO: abort the connection with H3_STREAM_CREATION_ERROR.
+                            throw new HttpRequestException("More than one control stream received.");
+                        }
+
+                        buffer.Discard(1);
+
+                        _ = ProcessServerControlStreamAsync(stream, buffer);
+                        stream = null;
+                        buffer = default;
+                        return;
+                    case (byte)Http3StreamType.QPackDecoder:
+                        if (Interlocked.Exchange(ref _haveServerQpackDecodeStream, 1) != 0)
+                        {
+                            _connection.Close(); // TODO: abort the connection with H3_STREAM_CREATION_ERROR.
+                            throw new HttpRequestException("More than one QPACK decode stream received.");
+                        }
+
+                        // The stream must not be closed, but we aren't using QPACK right now -- ignore.
+                        _ = stream.CopyToAsync(Stream.Null);
+                        stream = null;
+                        return;
+                    case (byte)Http3StreamType.QPackEncoder:
+                        if (Interlocked.Exchange(ref _haveServerQpackEncodeStream, 1) != 0)
+                        {
+                            _connection.Close(); // TODO: abort the connection with H3_STREAM_CREATION_ERROR.
+                            throw new HttpRequestException("More than one QPACK encode stream received.");
+                        }
+
+                        // The stream must not be closed, but we aren't using QPACK right now -- ignore.
+                        _ = stream.CopyToAsync(Stream.Null);
+                        stream = null;
+                        return;
+                    case (byte)Http3StreamType.Push:
+                        // We don't support push streams.
+                        // Because no maximum push stream ID was negotiated via a MAX_PUSH_ID frame, server should not have sent this. Abort the connection with H3_ID_ERROR.
+                        stream.Close(); // TODO: abort the connection with H3_ID_ERROR.
+                        throw new HttpRequestException("Received push stream without prior negotiation.");
+                    default:
+                        // Unknown stream type. Per spec, these must be ignored and aborted but not be considered a connection-level error.
+
+                        if (NetEventSource.IsEnabled)
+                        {
+                            // Read the rest of the integer, which might be more than 1 byte, so we can log it.
+
+                            long unknownStreamType;
+                            while (!VariableLengthIntegerHelper.TryRead(buffer.ActiveSpan, out unknownStreamType, out _))
+                            {
+                                buffer.EnsureAvailableSpace(1);
+                                bytesRead = await stream.ReadAsync(buffer.AvailableMemory, _cancellationSource.Token).ConfigureAwait(false);
+
+                                if (bytesRead == 0)
+                                {
+                                    unknownStreamType = -1;
+                                    break;
+                                }
+
+                                buffer.Commit(bytesRead);
+                            }
+
+                            NetEventSource.Info(this, $"Ignoring server-initiated stream of unknown type {unknownStreamType}.");
+                        }
+
+                        stream.Close(); // TODO: abort the stream with H3_STREAM_CREATION_ERROR.
+                        return;
+                }
+            }
+            finally
+            {
+                if (stream != null)
+                {
+                    await stream.DisposeAsync().ConfigureAwait(false);
                 }
 
+                buffer.Dispose();
+            }
+        }
+
+        private async Task ProcessServerControlStreamAsync(QuicStream stream, ArrayBuffer buffer)
+        {
+            using (stream)
+            using (buffer)
+            {
                 (Http3FrameType? frameType, long payloadLength) = await ReadFrameEnvelopeAsync().ConfigureAwait(false);
 
                 if (frameType == null)
@@ -147,12 +272,18 @@ namespace System.Net.Http
                         case Http3FrameType.GoAway:
                             // TODO: shut down connection.
                             break;
-                        case Http3FrameType.CancelPush:
-                        case Http3FrameType.PushPromise:
+                        case Http3FrameType.Headers:
+                        case Http3FrameType.Data:
                         case Http3FrameType.MaxPushId:
                         case Http3FrameType.DuplicatePush:
-                            // Servers should not send push promise to us.
+                            // Servers should not send these frames to a control stream.
+                            // TODO: close connection with H3_FRAME_UNEXPECTED.
                             throw new HttpRequestException($"Server sent inappropriate frame type {frameType}.");
+                        case Http3FrameType.PushPromise:
+                        case Http3FrameType.CancelPush:
+                            // Because we haven't sent any MAX_PUSH_ID frame, it is invalid to receive any push-related frames as they will all reference a too-large ID.
+                            // TODO: close connection with H3_FRAME_UNEXPECTED.
+                            break;
                         default:
                             await SkipUnknownPayloadAsync(frameType.GetValueOrDefault(), payloadLength).ConfigureAwait(false);
                             break;

@@ -17,7 +17,7 @@ namespace System.Net.Http.Headers
             Debug.Assert(HttpRuleParser.GetTokenLength(name, 0) == name.Length);
         }
 
-        public KnownHeader(string name, HttpHeaderType headerType, HttpHeaderParser parser, string[] knownValues = null, int? http2StaticTableIndex = null)
+        public KnownHeader(string name, HttpHeaderType headerType, HttpHeaderParser parser, string[] knownValues = null, int? http2StaticTableIndex = null, int? http3StaticTableIndex = null)
         {
             Debug.Assert(!string.IsNullOrEmpty(name));
             Debug.Assert(HttpRuleParser.GetTokenLength(name, 0) == name.Length);
@@ -52,5 +52,6 @@ namespace System.Net.Http.Headers
         public byte[] AsciiBytesWithColonSpace { get; }
         public HeaderDescriptor Descriptor => new HeaderDescriptor(this);
         public byte[] Http2EncodedName { get; }
+        public byte[] Http3EncodedName { get; }
     }
 }
