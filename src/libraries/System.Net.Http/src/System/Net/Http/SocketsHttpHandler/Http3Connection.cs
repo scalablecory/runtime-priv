@@ -9,6 +9,7 @@ using System.Net.Quic;
 using Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3;
 using System.Net.Http.HPack;
 using System.IO;
+using Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3.QPack;
 
 namespace System.Net.Http
 {
@@ -41,7 +42,10 @@ namespace System.Net.Http
         private int _haveServerQpackDecodeStream = 0;
         private int _haveServerQpackEncodeStream = 0;
 
+        private int _nextRequestStreamId = 0;
+
         public HttpAuthority Authority => _authority;
+        public HttpConnectionPool Pool => _pool;
 
         public Http3Connection(HttpConnectionPool pool, HttpAuthority origin, HttpAuthority authority, QuicConnection connection)
         {
@@ -60,34 +64,12 @@ namespace System.Net.Http
             return default;
         }
 
-        public override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        public override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
-            await Task.Delay(10).ConfigureAwait(false);
-            throw new NotImplementedException();
-        }
-
-        private ArrayBuffer WriteHeaders(HttpRequestMessage request)
-        {
-            var buffer = new ArrayBuffer(initialSize: 64, usePool: true);
-
-            // Reserve space for frame type + payload length + header block prefix.
-            // Payload length here is assumed to fit within 4 bytes.
-            // These values will be written after headers are serialized, as the variable-length payload is an int.
-            buffer.Commit(1 + 4 + 2);
-
-            HttpMethod normalizedMethod = HttpMethod.Normalize(request.Method);
-
-            if (normalizedMethod.Http3EncodedBytes != null)
-            {
-                buffer.EnsureAvailableSpace(normalizedMethod.Http3EncodedBytes.Length);
-                normalizedMethod.Http3EncodedBytes.CopyTo(buffer.AvailableSpan);
-                buffer.Commit()
-            }
-        }
-
-        private async ValueTask WriteBytesAsync(ReadOnlyMemory<byte> memory, CancellationToken cancellationToken)
-        {
-
+            //TODO: respect server's QUIC stream maximum.
+            int streamId = Interlocked.Add(ref _nextRequestStreamId, 4);
+            var stream = new Http3Stream(this, _connection.OpenBidirectionalStream()); // TODO: open the bidi stream using the stream ID.
+            return stream.SendAsync(request, cancellationToken);
         }
 
         public override void Trace(string message, [CallerMemberName] string memberName = null) =>

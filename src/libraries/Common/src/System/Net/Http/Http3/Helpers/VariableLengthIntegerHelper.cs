@@ -156,46 +156,57 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3
             }
         }
 
-        public static int WriteInteger(Span<byte> buffer, int longToEncode)
+        public static bool TryWrite(Span<byte> buffer, long longToEncode, out int bytesWritten)
         {
-            Debug.Assert(longToEncode > 0);
-            return WriteInteger(buffer, longToEncode);
+            if (longToEncode < OneByteLimit)
+            {
+                if (!buffer.IsEmpty)
+                {
+                    buffer[0] = (byte)longToEncode;
+                    bytesWritten = 1;
+                    return true;
+                }
+            }
+            else if (longToEncode < TwoByteLimit)
+            {
+                if (BinaryPrimitives.TryWriteUInt16BigEndian(buffer, (ushort)((uint)longToEncode | 0x4000u)))
+                {
+                    bytesWritten = 2;
+                    return true;
+                }
+            }
+            else if (longToEncode < FourByteLimit)
+            {
+                if (BinaryPrimitives.TryWriteUInt32BigEndian(buffer, (uint)longToEncode | 0x80000000))
+                {
+                    bytesWritten = 4;
+                    return true;
+                }
+            }
+            else
+            {
+                if (BinaryPrimitives.TryWriteUInt64BigEndian(buffer, (ulong)longToEncode | 0xC000000000000000))
+                {
+                    bytesWritten = 8;
+                    return true;
+                }
+            }
+
+            bytesWritten = 0;
+            return false;
         }
 
         public static int WriteInteger(Span<byte> buffer, long longToEncode)
         {
-            Debug.Assert(buffer.Length >= 8);
-            Debug.Assert(longToEncode >= 0);
-            Debug.Assert(longToEncode < long.MaxValue / 2);
-
-            if (longToEncode < OneByteLimit)
-            {
-                buffer[0] = (byte)longToEncode;
-                return 1;
-            }
-            else if (longToEncode < TwoByteLimit)
-            {
-                BinaryPrimitives.WriteUInt16BigEndian(buffer, (ushort)longToEncode);
-                buffer[0] |= 0x40;
-                return 2;
-            }
-            else if (longToEncode < FourByteLimit)
-            {
-                BinaryPrimitives.WriteUInt32BigEndian(buffer, (uint)longToEncode);
-                buffer[0] |= 0x80;
-                return 4;
-            }
-            else
-            {
-                BinaryPrimitives.WriteUInt64BigEndian(buffer, (ulong)longToEncode);
-                buffer[0] |= 0xC0;
-                return 8;
-            }
+            bool res = TryWrite(buffer, longToEncode, out int bytesWritten);
+            Debug.Assert(res == true);
+            return bytesWritten;
         }
 
-        public static int GetByteCount(ulong value)
+        public static int GetByteCount(long value)
         {
-            Debug.Assert(value <= ulong.MaxValue / 4);
+            Debug.Assert(value >= 0);
+            Debug.Assert(value < long.MaxValue / 2);
 
             return
                 value < OneByteLimit ? 1 :

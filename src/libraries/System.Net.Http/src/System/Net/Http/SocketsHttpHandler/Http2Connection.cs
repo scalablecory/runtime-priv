@@ -1068,36 +1068,36 @@ namespace System.Net.Http
             // Method is normalized so we can do reference equality here.
             if (ReferenceEquals(normalizedMethod, HttpMethod.Get))
             {
-                WriteIndexedHeader(StaticTable.MethodGet);
+                WriteIndexedHeader(H2StaticTable.MethodGet);
             }
             else if (ReferenceEquals(normalizedMethod, HttpMethod.Post))
             {
-                WriteIndexedHeader(StaticTable.MethodPost);
+                WriteIndexedHeader(H2StaticTable.MethodPost);
             }
             else
             {
-                WriteIndexedHeader(StaticTable.MethodGet, normalizedMethod.Method);
+                WriteIndexedHeader(H2StaticTable.MethodGet, normalizedMethod.Method);
             }
 
-            WriteIndexedHeader(_stream is SslStream ? StaticTable.SchemeHttps : StaticTable.SchemeHttp);
+            WriteIndexedHeader(_stream is SslStream ? H2StaticTable.SchemeHttps : H2StaticTable.SchemeHttp);
 
             if (request.HasHeaders && request.Headers.Host != null)
             {
-                WriteIndexedHeader(StaticTable.Authority, request.Headers.Host);
+                WriteIndexedHeader(H2StaticTable.Authority, request.Headers.Host);
             }
             else
             {
-                WriteBytes(_pool._encodedAuthorityHostHeader);
+                WriteBytes(_pool._http2EncodedAuthorityHostHeader);
             }
 
             string pathAndQuery = request.RequestUri.PathAndQuery;
             if (pathAndQuery == "/")
             {
-                WriteIndexedHeader(StaticTable.PathSlash);
+                WriteIndexedHeader(H2StaticTable.PathSlash);
             }
             else
             {
-                WriteIndexedHeader(StaticTable.PathSlash, pathAndQuery);
+                WriteIndexedHeader(H2StaticTable.PathSlash, pathAndQuery);
             }
 
             if (request.HasHeaders)

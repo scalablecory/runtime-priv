@@ -23,15 +23,6 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3.QPack
          */
         public static bool EncodeIndexedHeaderField(int index, Span<byte> destination, out int bytesWritten)
         {
-            if (destination.IsEmpty)
-            {
-                bytesWritten = 0;
-                return false;
-            }
-
-            EncodeHeaderBlockPrefix(destination, out bytesWritten);
-            destination = destination.Slice(bytesWritten);
-
             return IntegerEncoder.Encode(index, 6, destination, out bytesWritten);
         }
 
@@ -116,10 +107,40 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3.QPack
             return false;
         }
 
-        public static bool EncodeLiteralHeaderFieldWithoutNameReference(int index, Span<byte> destination, out int bytesWritten)
+        public static bool EncodeLiteralHeaderFieldWithoutNameReference(string name, string value, Span<byte> destination, out int bytesWritten)
         {
-            bytesWritten = 0;
-            return false;
+            if (!EncodeNameString(name, destination, out int nameLength))
+            {
+                bytesWritten = 0;
+                return false;
+            }
+
+            if (!EncodeValueString(value, destination.Slice(nameLength), out int valueLength))
+            {
+                bytesWritten = 0;
+                return false;
+            }
+
+            bytesWritten = nameLength + valueLength;
+            return true;
+        }
+
+        public static bool EncodeLiteralHeaderFieldWithoutNameReference(string name, ReadOnlySpan<string> values, string valueSeparator, Span<byte> destination, out int bytesWritten)
+        {
+            if (!EncodeNameString(name, destination, out int nameLength))
+            {
+                bytesWritten = 0;
+                return false;
+            }
+
+            if (!EncodeValueStrings(values, valueSeparator, destination.Slice(nameLength), out int valueLength))
+            {
+                bytesWritten = 0;
+                return false;
+            }
+
+            bytesWritten = nameLength + valueLength;
+            return true;
         }
 
         /*
@@ -337,30 +358,6 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3.QPack
             throw new NotImplementedException();
         }
 
-        /// <summary>Encodes a "Literal Header Field without Indexing" to a new array.</summary>
-        public static byte[] EncodeLiteralHeaderFieldWithoutIndexingToAllocatedArray(int index, string value)
-        {
-            Span<byte> span =
-#if DEBUG
-                stackalloc byte[4]; // to validate growth algorithm
-#else
-                stackalloc byte[512];
-#endif
-            while (true)
-            {
-                if (EncodeLiteralHeaderFieldWithNameReference(index, value, span, out int length))
-                {
-                    return span.Slice(0, length).ToArray();
-                }
-
-                // This is a rare path, only used once per HTTP/2 connection and only
-                // for very long host names.  Just allocate rather than complicate
-                // the code with ArrayPool usage.  In practice we should never hit this,
-                // as hostnames should be <= 255 characters.
-                span = new byte[span.Length * 2];
-            }
-        }
-
         // TODO these are fairly hard coded for the first two bytes to be zero.
         public bool BeginEncode(IEnumerable<KeyValuePair<string, string>> headers, Span<byte> buffer, out int length)
         {
@@ -399,7 +396,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3.QPack
 
             do
             {
-                if (!EncodeLiteralValueWithoutNameReference(_enumerator.Current.Key, _enumerator.Current.Value, buffer.Slice(length), out var headerLength))
+                if (!EncodeLiteralHeaderFieldWithoutNameReference(_enumerator.Current.Key, _enumerator.Current.Value, buffer.Slice(length), out var headerLength))
                 {
                     if (length == 0 && throwIfNoneEncoded)
                     {
@@ -414,74 +411,99 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3.QPack
             return true;
         }
 
-        public static bool EncodeLiteralValueWithoutNameReference(string name, string value, Span<byte> buffer, out int length)
-        {
-            var i = 0;
-            length = 0;
-
-            if (buffer.IsEmpty)
-            {
-                return false;
-            }
-
-            if (!EncodeNameString(name, buffer.Slice(i), out var nameLength, lowercase: true))
-            {
-                return false;
-            }
-
-            i += nameLength;
-
-            if (i >= buffer.Length)
-            {
-                return false;
-            }
-
-            if (!EncodeValueString(value, buffer.Slice(i), out var valueLength))
-            {
-                return false;
-            }
-
-            i += valueLength;
-
-            length = i;
-            return true;
-        }
-
         private static bool EncodeValueString(string s, Span<byte> buffer, out int length)
         {
-            var i = 0;
-            length = 0;
-
             if (buffer.IsEmpty)
             {
+                length = 0;
                 return false;
             }
 
             buffer[0] = 0;
-
             if (!IntegerEncoder.Encode(s.Length, 7, buffer, out var nameLength))
             {
+                length = 0;
                 return false;
             }
 
-            i += nameLength;
-
-            // TODO: use huffman encoding
-            for (var j = 0; j < s.Length; j++)
+            buffer = buffer.Slice(nameLength);
+            if (buffer.Length < s.Length)
             {
-                if (i >= buffer.Length)
-                {
-                    return false;
-                }
-
-                buffer[i++] = (byte)s[j];
+                length = 0;
+                return false;
             }
 
-            length = i;
+            EncodeValueStringPart(s, buffer);
+
+            length = nameLength + s.Length;
             return true;
         }
 
-        private static bool EncodeNameString(string s, Span<byte> buffer, out int length, bool lowercase)
+        private static bool EncodeValueStrings(ReadOnlySpan<string> values, string separator, Span<byte> buffer, out int length)
+        {
+            if (buffer.IsEmpty)
+            {
+                length = 0;
+                return false;
+            }
+
+            int valueLength = separator.Length * (values.Length - 1);
+            for (int i = 0; i < values.Length; ++i)
+            {
+                valueLength += values[i].Length;
+            }
+
+            buffer[0] = 0;
+            if (!IntegerEncoder.Encode(valueLength, 7, buffer, out var nameLength))
+            {
+                length = 0;
+                return false;
+            }
+
+            buffer = buffer.Slice(nameLength);
+            if (buffer.Length < valueLength)
+            {
+                length = 0;
+                return false;
+            }
+
+            if (values.Length > 0)
+            {
+                string value = values[0];
+                EncodeValueStringPart(value, buffer);
+                buffer = buffer.Slice(value.Length);
+
+                for (int i = 1; i < values.Length; ++i)
+                {
+                    EncodeValueStringPart(separator, buffer);
+                    buffer = buffer.Slice(separator.Length);
+
+                    value = values[i];
+                    EncodeValueStringPart(value, buffer);
+                    buffer = buffer.Slice(value.Length);
+                }
+            }
+
+            length = nameLength + valueLength;
+            return true;
+        }
+
+        private static void EncodeValueStringPart(string s, Span<byte> buffer)
+        {
+            for (int i = 0; i < s.Length; ++i)
+            {
+                char ch = s[i];
+
+                if (ch > 127)
+                {
+                    throw new QPackEncodingException("ASCII header value.");
+                }
+
+                buffer[i] = (byte)ch;
+            }
+        }
+
+        private static bool EncodeNameString(string s, Span<byte> buffer, out int length)
         {
             const int toLowerMask = 0x20;
 
@@ -510,7 +532,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3.QPack
                     return false;
                 }
 
-                buffer[i++] = (byte)(s[j] | (lowercase && s[j] >= (byte)'A' && s[j] <= (byte)'Z' ? toLowerMask : 0));
+                buffer[i++] = (byte)(s[j] | (s[j] >= (byte)'A' && s[j] <= (byte)'Z' ? toLowerMask : 0));
             }
 
             length = i;
@@ -529,7 +551,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3.QPack
                 case 404:
                 case 500:
                     // TODO this isn't safe, some index can be larger than 64. Encoded here!
-                    buffer[0] = (byte)(0xC0 | StaticTable.Instance.StatusIndex[statusCode]);
+                    buffer[0] = (byte)(0xC0 | H3StaticTable.Instance.StatusIndex[statusCode]);
                     return 1;
                 default:
                     // Send as Literal Header Field Without Indexing - Indexed Name

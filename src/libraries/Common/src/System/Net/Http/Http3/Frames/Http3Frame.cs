@@ -23,5 +23,23 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3
             bytesRead = 0;
             return false;
         }
+
+        public static bool TryWriteFrameEnvelope(byte preEncodedFrameTypeId, long payloadLength, Span<byte> buffer, out int bytesWritten)
+        {
+            if (buffer.Length != 0)
+            {
+                buffer[0] = preEncodedFrameTypeId;
+                buffer = buffer.Slice(1);
+
+                if (VariableLengthIntegerHelper.TryWrite(buffer, payloadLength, out int payloadLengthEncodedLength))
+                {
+                    bytesWritten = payloadLengthEncodedLength + 1;
+                    return true;
+                }
+            }
+
+            bytesWritten = 0;
+            return false;
+        }
     }
 }

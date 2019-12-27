@@ -128,5 +128,10 @@ namespace System.Net.Http
 
             Debug.Assert(byteCount <= AvailableLength);
         }
+
+        public void Grow()
+        {
+            EnsureAvailableSpace(AvailableLength + 1);
+        }
     }
 }

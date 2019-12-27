@@ -17,6 +17,7 @@ using System.Security.Authentication;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3.QPack;
 
 namespace System.Net.Http
 {
@@ -28,7 +29,6 @@ namespace System.Net.Http
         private readonly HttpConnectionPoolManager _poolManager;
         private readonly HttpConnectionKind _kind;
         private readonly Uri _proxyUri;
-        internal readonly byte[] _encodedAuthorityHostHeader;
 
         /// <summary>The origin authority used to construct the <see cref="HttpConnectionPool"/>.</summary>
         private readonly HttpAuthority _originAuthority;
@@ -65,10 +65,12 @@ namespace System.Net.Http
         private Http2Connection _http2Connection;
         private SemaphoreSlim _http2ConnectionCreateLock;
         private byte[] _http2AltSvcOriginUri;
+        internal readonly byte[] _http2EncodedAuthorityHostHeader;
 
         private readonly bool _http3Enabled;
         private Http3Connection _http3Connection;
         private SemaphoreSlim _http3ConnectionCreateLock;
+        internal readonly byte[] _http3EncodedAuthorityHostHeader;
 
         /// <summary>For non-proxy connection pools, this is the host name in bytes; for proxies, null.</summary>
         private readonly byte[] _hostHeaderValueBytes;
@@ -184,7 +186,8 @@ namespace System.Net.Http
                 Debug.Assert(Encoding.ASCII.GetString(_hostHeaderValueBytes) == hostHeader);
                 if (sslHostName == null)
                 {
-                    _encodedAuthorityHostHeader = HPackEncoder.EncodeLiteralHeaderFieldWithoutIndexingToAllocatedArray(StaticTable.Authority, hostHeader);
+                    _http2EncodedAuthorityHostHeader = HPackEncoder.EncodeLiteralHeaderFieldWithoutIndexingToAllocatedArray(H2StaticTable.Authority, hostHeader);
+                    _http3EncodedAuthorityHostHeader = QPackEncoder.EncodeLiteralHeaderFieldWithStaticNameReferenceToArray(H3StaticTable.Authority, hostHeader);
                 }
             }
 
@@ -213,7 +216,9 @@ namespace System.Net.Http
                     // allow it.
 
                     Debug.Assert(hostHeader != null);
-                    _encodedAuthorityHostHeader = HPackEncoder.EncodeLiteralHeaderFieldWithoutIndexingToAllocatedArray(StaticTable.Authority, hostHeader);
+                    _http2EncodedAuthorityHostHeader = HPackEncoder.EncodeLiteralHeaderFieldWithoutIndexingToAllocatedArray(H2StaticTable.Authority, hostHeader);
+                    _http3EncodedAuthorityHostHeader = QPackEncoder.EncodeLiteralHeaderFieldWithStaticNameReferenceToArray(H3StaticTable.Authority, hostHeader);
+
                 }
 
                 if (_http3Enabled)
@@ -672,7 +677,7 @@ namespace System.Net.Http
                     throw new HttpRequestException("QUIC connected but no HTTP/3 indicated via ALPN.", null, RequestRetryType.RetryOnSameOrNextProxy);
                 }
 
-                http3Connection = new Http3Connection(_originAuthority, authority, quicConnection);
+                http3Connection = new Http3Connection(this, _originAuthority, authority, quicConnection);
                 _http3Connection = http3Connection;
 
                 if (NetEventSource.IsEnabled)

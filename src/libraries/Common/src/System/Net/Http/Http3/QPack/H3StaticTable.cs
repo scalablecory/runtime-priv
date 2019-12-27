@@ -7,9 +7,9 @@ using System.Text;
 
 namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3.QPack
 {
-    internal class StaticTable
+    internal class H3StaticTable
     {
-        private static readonly StaticTable _instance = new StaticTable();
+        private static readonly H3StaticTable _instance = new H3StaticTable();
 
         private readonly Dictionary<int, int> _statusIndex = new Dictionary<int, int>
         {
@@ -40,11 +40,11 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3.QPack
             [HttpMethod.Put] = 21,
         };
 
-        private StaticTable()
+        private H3StaticTable()
         {
         }
 
-        public static StaticTable Instance => _instance;
+        public static H3StaticTable Instance => _instance;
 
         public int Count => _staticTable.Length;
 
@@ -159,6 +159,10 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3.QPack
         private static HeaderField CreateHeaderField(string name, string value)
             => new HeaderField(Encoding.ASCII.GetBytes(name), Encoding.ASCII.GetBytes(value));
 
+        public const int Authority = 0;
+        public const int PathSlash = 1;
+        public const int ContentLength0 = 4;
+        public const int Cookie = 5;
         public const int MethodConnect = 15;
         public const int MethodDelete = 16;
         public const int MethodGet = 17;
@@ -166,5 +170,6 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3.QPack
         public const int MethodOptions = 19;
         public const int MethodPost = 20;
         public const int MethodPut = 21;
+        public const int SchemeHttps = 23;
     }
 }
