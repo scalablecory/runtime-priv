@@ -4,9 +4,13 @@
 using System;
 using System.Buffers;
 using System.Net.Http.HPack;
-using Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http;
 
+#if KESTREL
+using Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http;
 namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3.QPack
+#else
+namespace System.Net.Http
+#endif
 {
     internal class QPackDecoder
     {
@@ -164,11 +168,15 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3.QPack
             // (I think this can be done based on length outside of this)
             foreach (var segment in headerBlock)
             {
-                var span = segment.Span;
-                for (var i = 0; i < span.Length; i++)
-                {
-                    OnByte(span[i], handler);
-                }
+                Decode(segment.Span, handler);
+            }
+        }
+
+        public void Decode(ReadOnlySpan<byte> headerBlock, IHttpHeadersHandler handler)
+        {
+            foreach (byte b in headerBlock)
+            {
+                OnByte(b, handler);
             }
         }
 
@@ -468,7 +476,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3.QPack
             }
         }
 
-        // TODO 
+        // TODO
         private void OnRequiredInsertCount(int requiredInsertCount)
         {
             _requiredInsertCount = requiredInsertCount;
@@ -502,7 +510,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3.QPack
         {
             try
             {
-                return _s ? StaticTable.Instance[index] : _dynamicTable[index];
+                return _s ? H3StaticTable.Instance[index] : _dynamicTable[index];
             }
             catch (IndexOutOfRangeException ex)
             {

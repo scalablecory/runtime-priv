@@ -5,7 +5,12 @@ using System.Collections.Generic;
 using System.Net.Http;
 using System.Text;
 
+#if KESTREL
+using Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http;
 namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3.QPack
+#else
+namespace System.Net.Http
+#endif
 {
     internal class H3StaticTable
     {
@@ -31,7 +36,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3.QPack
 
         private readonly Dictionary<HttpMethod, int> _methodIndex = new Dictionary<HttpMethod, int>
         {
-            // TODO connect is intenral to system.net.http
+            // TODO connect is internal to system.net.http
             [HttpMethod.Delete] = 16,
             [HttpMethod.Get] = 17,
             [HttpMethod.Head] = 18,

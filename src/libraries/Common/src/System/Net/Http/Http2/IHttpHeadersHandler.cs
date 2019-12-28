@@ -3,8 +3,6 @@
 // See the LICENSE file in the project root for more information.
 
 #if KESTREL
-using System;
-
 namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http
 #else
 namespace System.Net.Http

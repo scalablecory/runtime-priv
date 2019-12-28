@@ -266,11 +266,11 @@ namespace System.Net.Http
                             // Because we haven't sent any MAX_PUSH_ID frame, it is invalid to receive any push-related frames as they will all reference a too-large ID.
                             // TODO: close connection with H3_FRAME_UNEXPECTED.
                             break;
-                        default:
-                            await SkipUnknownPayloadAsync(frameType.GetValueOrDefault(), payloadLength).ConfigureAwait(false);
-                            break;
                         case null:
                             // TODO: end of stream reached. check if we're shutting down, or if this is an error (this stream should not be closed for life of connection).
+                            break;
+                        default:
+                            await SkipUnknownPayloadAsync(frameType.GetValueOrDefault(), payloadLength).ConfigureAwait(false);
                             break;
                     }
                 }

@@ -3,7 +3,12 @@
 
 using System;
 
+#if KESTREL
+using Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http;
 namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3.QPack
+#else
+namespace System.Net.Http
+#endif
 {
     internal readonly struct HeaderField
     {

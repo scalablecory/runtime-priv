@@ -39,10 +39,11 @@ namespace System.Net.Http
 
         public void Dispose()
         {
+            _activeStart = 0;
+            _availableStart = 0;
+
             if (_usePool)
             {
-                _activeStart = _availableStart = 0;
-
                 byte[] array = _bytes;
                 _bytes = null;
 

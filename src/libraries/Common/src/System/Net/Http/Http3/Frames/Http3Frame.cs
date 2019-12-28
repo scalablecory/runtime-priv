@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0. See License.txt in the project root for license information.
 
 using System;
+using System.Diagnostics;
 
 namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3
 {
@@ -24,11 +25,13 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3
             return false;
         }
 
-        public static bool TryWriteFrameEnvelope(byte preEncodedFrameTypeId, long payloadLength, Span<byte> buffer, out int bytesWritten)
+        public static bool TryWriteFrameEnvelope(Http3FrameType frameType, long payloadLength, Span<byte> buffer, out int bytesWritten)
         {
+            Debug.Assert(VariableLengthIntegerHelper.GetByteCount((long)frameType) == 1, $"{nameof(TryWriteFrameEnvelope)} assumes {nameof(frameType)} will fit within a single byte varint.");
+
             if (buffer.Length != 0)
             {
-                buffer[0] = preEncodedFrameTypeId;
+                buffer[0] = (byte)frameType;
                 buffer = buffer.Slice(1);
 
                 if (VariableLengthIntegerHelper.TryWrite(buffer, payloadLength, out int payloadLengthEncodedLength))
