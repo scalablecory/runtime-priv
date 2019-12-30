@@ -249,12 +249,13 @@ namespace System.Net.Http
                         return;
                     case Http3FrameType.Headers:
                         // Pick up any trailing headers.
+                        _trailingHeaders = new List<(HeaderDescriptor name, string value)>();
                         await ReadHeadersAsync(payloadLength, cancellationToken).ConfigureAwait(false);
-
 
                         // Stop looping after a trailing header.
                         // There may be extra frames after this one, but they would all be unknown extension
                         // frames that can be safely ignored. Just stop reading here.
+                        // Note: this does leave us open to a bad server sending us an out of order DATA frame.
                         goto case null;
                     case Http3FrameType.Data:
                         // The sum of data frames must equal content length. Because this method is only
@@ -781,10 +782,18 @@ namespace System.Net.Http
                             break;
                         case Http3FrameType.Headers:
                             // Read any trailing headers.
+                            if (_stream._trailingHeaders != null)
+                            {
+                                string msg = "More than one trailing HEADERS frame received.";
+                                throw new IOException(msg, new HttpRequestException(msg));
+                            }
+
+                            _stream._trailingHeaders = new List<(HeaderDescriptor name, string value)>();
                             _stream.ReadHeadersAsync(payloadLength, CancellationToken.None).GetAwaiter().GetResult();
 
                             // There may be more frames after this one, but they would all be unknown extension
                             // frames that we are allowed to skip. Just close the stream early.
+                            // Note: this does leave us open to a bad server sending us an out of order DATA frame.
                             goto case null;
                         case null:
                             // End of stream.
@@ -842,10 +851,18 @@ namespace System.Net.Http
                             break;
                         case Http3FrameType.Headers:
                             // Read any trailing headers.
+                            if (_stream._trailingHeaders != null)
+                            {
+                                string msg = "More than one trailing HEADERS frame received.";
+                                throw new IOException(msg, new HttpRequestException(msg));
+                            }
+
+                            _stream._trailingHeaders = new List<(HeaderDescriptor name, string value)>();
                             await _stream.ReadHeadersAsync(payloadLength, cancellationToken).ConfigureAwait(false);
 
                             // There may be more frames after this one, but they would all be unknown extension
                             // frames that we are allowed to skip. Just close the stream early.
+                            // Note: this does leave us open to a bad server sending us an out of order DATA frame.
                             goto case null;
                         case null:
                             // End of stream.

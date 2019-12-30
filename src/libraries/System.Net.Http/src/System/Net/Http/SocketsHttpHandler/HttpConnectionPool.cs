@@ -8,6 +8,7 @@ using System.Globalization;
 using System.IO;
 using System.Net.Http.Headers;
 using System.Net.Http.HPack;
+using System.Net.Http.QPack;
 using System.Net.Quic;
 using System.Net.Security;
 using System.Net.Sockets;
@@ -17,7 +18,6 @@ using System.Security.Authentication;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
-using Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3.QPack;
 
 namespace System.Net.Http
 {

@@ -4,7 +4,7 @@
 
 using System.Collections.Generic;
 using System.Diagnostics;
-using Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3.QPack;
+using System.Net.Http.QPack;
 
 namespace System.Net.Http
 {
@@ -14,15 +14,15 @@ namespace System.Net.Http
         private readonly byte[] _http3EncodedBytes;
         private int _hashcode;
 
-        private static readonly HttpMethod s_getMethod = new HttpMethod("GET", http3StaticTableIndex: StaticTable.MethodGet);
-        private static readonly HttpMethod s_putMethod = new HttpMethod("PUT", http3StaticTableIndex: StaticTable.MethodPut);
-        private static readonly HttpMethod s_postMethod = new HttpMethod("POST", http3StaticTableIndex: StaticTable.MethodPost);
-        private static readonly HttpMethod s_deleteMethod = new HttpMethod("DELETE", http3StaticTableIndex: StaticTable.MethodDelete);
-        private static readonly HttpMethod s_headMethod = new HttpMethod("HEAD", http3StaticTableIndex: StaticTable.MethodHead);
-        private static readonly HttpMethod s_optionsMethod = new HttpMethod("OPTIONS", http3StaticTableIndex: StaticTable.MethodOptions);
+        private static readonly HttpMethod s_getMethod = new HttpMethod("GET", http3StaticTableIndex: H3StaticTable.MethodGet);
+        private static readonly HttpMethod s_putMethod = new HttpMethod("PUT", http3StaticTableIndex: H3StaticTable.MethodPut);
+        private static readonly HttpMethod s_postMethod = new HttpMethod("POST", http3StaticTableIndex: H3StaticTable.MethodPost);
+        private static readonly HttpMethod s_deleteMethod = new HttpMethod("DELETE", http3StaticTableIndex: H3StaticTable.MethodDelete);
+        private static readonly HttpMethod s_headMethod = new HttpMethod("HEAD", http3StaticTableIndex: H3StaticTable.MethodHead);
+        private static readonly HttpMethod s_optionsMethod = new HttpMethod("OPTIONS", http3StaticTableIndex: H3StaticTable.MethodOptions);
         private static readonly HttpMethod s_traceMethod = new HttpMethod("TRACE");
         private static readonly HttpMethod s_patchMethod = new HttpMethod("PATCH");
-        private static readonly HttpMethod s_connectMethod = new HttpMethod("CONNECT", http3StaticTableIndex: StaticTable.MethodConnect);
+        private static readonly HttpMethod s_connectMethod = new HttpMethod("CONNECT", http3StaticTableIndex: H3StaticTable.MethodConnect);
 
         private static readonly Dictionary<HttpMethod, HttpMethod> s_knownMethods = new Dictionary<HttpMethod, HttpMethod>(9)
         {
@@ -114,7 +114,7 @@ namespace System.Net.Http
         {
             _http3EncodedBytes = http3StaticTableIndex != null ?
                 QPackEncoder.EncodeStaticIndexedHeaderFieldToNewArray(http3StaticTableIndex.GetValueOrDefault()) :
-                QPackEncoder.EncodeLiteralHeaderFieldWithStaticNameReferenceToArray(StaticTable.MethodGet, method);
+                QPackEncoder.EncodeLiteralHeaderFieldWithStaticNameReferenceToArray(H3StaticTable.MethodGet, method);
         }
 
         #region IEquatable<HttpMethod> Members
