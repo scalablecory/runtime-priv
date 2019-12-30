@@ -1,15 +1,8 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Threading;
+﻿using System.Threading;
 using System.Threading.Tasks;
 using System.Runtime.CompilerServices;
 using System.Net.Quic;
-using Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3;
-using System.Net.Http.HPack;
 using System.IO;
-using Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3.QPack;
 
 namespace System.Net.Http
 {
@@ -68,18 +61,18 @@ namespace System.Net.Http
         {
             //TODO: respect server's QUIC stream maximum.
             int streamId = Interlocked.Add(ref _nextRequestStreamId, 4);
-            var stream = new Http3Stream(this, _connection.OpenBidirectionalStream()); // TODO: open the bidi stream using the stream ID.
-            return stream.SendAsync(request, cancellationToken);
+            var stream = new Http3Stream(request, this, _connection.OpenBidirectionalStream()); // TODO: open the bidi stream using the stream ID.
+            return stream.SendAsync(cancellationToken);
         }
 
         public override void Trace(string message, [CallerMemberName] string memberName = null) =>
             Trace(0, message, memberName);
 
-        internal void Trace(int streamId, string message, [CallerMemberName] string memberName = null) =>
+        internal void Trace(long streamId, string message, [CallerMemberName] string memberName = null) =>
             NetEventSource.Log.HandlerMessage(
                 _pool?.GetHashCode() ?? 0,    // pool ID
                 GetHashCode(),                // connection ID
-                streamId,                     // stream ID
+                (int)streamId,                // stream ID
                 memberName,                   // method name
                 message);                     // message
 

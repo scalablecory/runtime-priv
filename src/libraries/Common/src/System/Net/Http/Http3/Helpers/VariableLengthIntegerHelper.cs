@@ -6,7 +6,11 @@ using System.Buffers;
 using System.Buffers.Binary;
 using System.Diagnostics;
 
+#if KESTREL
 namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3
+#else
+namespace System.Net.Http
+#endif
 {
     /// <summary>
     /// Variable length integer encoding and decoding methods. Based on https://tools.ietf.org/html/draft-ietf-quic-transport-24#section-16.

@@ -1,23 +1,20 @@
 ﻿// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See License.txt in the project root for license information.
 
-using System;
-using System.Buffers;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
-using System.Linq;
 using System.Net.Http.Headers;
 using System.Net.Quic;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
-using Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3;
-using Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3.QPack;
+using System.Runtime.CompilerServices;
+using System.Net.Http.QPack;
 
 namespace System.Net.Http
 {
-    internal sealed class Http3Stream : IHttpHeadersHandler
+    internal sealed class Http3Stream : IHttpHeadersHandler, IAsyncDisposable, IDisposable
     {
         /// <summary>
         /// Unknown frame types with a payload larger than this will result in tearing down the connection.
@@ -25,34 +22,56 @@ namespace System.Net.Http
         /// </summary>
         private const int MaximumUnknownFramePayloadLength = 4096;
 
-        private Http3Connection _connection;
+        private readonly HttpRequestMessage _request;
+        private readonly Http3Connection _connection;
         private QuicStream _stream;
         private ArrayBuffer _buffer;
-        private TaskCompletionSource<int> _expect100ContinueCompletionSource;
+        private TaskCompletionSource<bool> _expect100ContinueCompletionSource; // true indicates we should send content (e.g. received 100 Continue).
         private QPackDecoder _headerDecoder = new QPackDecoder(0, 0);
+        private State _headerState;
+        private HttpResponseMessage _response;
 
         /// <summary>Reusable array used to get the values for each header being written to the wire.</summary>
         private string[] _headerValues = Array.Empty<string>();
 
-        public Http3Stream(Http3Connection connection, QuicStream stream)
+        /// <summary>Any trailing headers.</summary>
+        private List<(HeaderDescriptor name, string value)> _trailingHeaders;
+
+        public Http3Stream(HttpRequestMessage request, Http3Connection connection, QuicStream stream)
         {
+            _request = request;
             _connection = connection;
             _stream = stream;
             _buffer = new ArrayBuffer(initialSize: 64, usePool: true);
         }
 
-        public async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        public void Dispose()
         {
-            if (request.HasHeaders && request.Headers.ExpectContinue == true)
+            if (_stream != null)
             {
-                _expect100ContinueCompletionSource = new TaskCompletionSource<int>();
+                _stream.Dispose();
+                _buffer.Dispose();
+                _stream = null;
             }
+        }
 
-            BufferHeaders(request);
+        public async ValueTask DisposeAsync()
+        {
+            if (_stream != null)
+            {
+                await _stream.DisposeAsync().ConfigureAwait(false);
+                _buffer.Dispose();
+                _stream = null;
+            }
+        }
+
+        public async Task<HttpResponseMessage> SendAsync(CancellationToken cancellationToken)
+        {
+            BufferHeaders(_request);
 
             long firstFrameLengthRemaining = 0;
 
-            if (request.Content != null && request.Content.TryComputeLength(out firstFrameLengthRemaining))
+            if (_request.Content != null && _request.Content.TryComputeLength(out firstFrameLengthRemaining))
             {
                 BufferFrameEnvelope((byte)Http3FrameType.Data, firstFrameLengthRemaining);
             }
@@ -64,75 +83,205 @@ namespace System.Net.Http
             {
                 await _stream.FlushAsync(cancellationToken).ConfigureAwait(false);
             }
-
-            if (_buffer.Capacity < 512)
+            else if (_request.Content == null)
             {
-                // We should have sent everything, so empty the buffer so it can be used for recv.
-                _buffer.Discard(_buffer.ActiveLength);
-                Debug.Assert(_buffer.ActiveLength == 0);
+                _stream.ShutdownWrite();
+            }
+
+            // Empty the buffer so it can be used for receive.
+            _buffer.Discard(_buffer.ActiveLength);
+            Debug.Assert(_buffer.ActiveLength == 0);
+
+            // If using Expect 100 Continue, setup a TCS to wait to send content until we get a response.
+            if (_request.HasHeaders && _request.Headers.ExpectContinue == true)
+            {
+                _expect100ContinueCompletionSource = new TaskCompletionSource<bool>();
+            }
+
+            // If using duplex content, the content will continue sending after this method completes.
+            // So, only observe the cancellation token if not using duplex.
+            CancellationToken sendContentCancellationToken = _request.Content?.AllowDuplex == false ? cancellationToken : default;
+
+            // In parallel, send content and read response.
+            // Depending on Expect 100 Continue usage, one will depend on the other making progress.
+            Task sendContentTask = _request.Content != null ? SendContentAsync(_request.Content, firstFrameLengthRemaining, sendContentCancellationToken) : Task.CompletedTask;
+            Task readResponseTask = ReadResponseAsync(cancellationToken);
+
+            // If we're not doing duplex, wait for content to finish sending here.
+            // If we are doing duplex and have the unlikely event that it completes here, observe the result.
+            // See Http2Connection.SendAsync for a full comment on this logic -- it is identical behavior.
+            if (sendContentTask.IsCompleted ||
+                _request.Content?.AllowDuplex != true ||
+                sendContentTask == await Task.WhenAny(sendContentTask, readResponseTask).ConfigureAwait(false) ||
+                sendContentTask.IsCompleted)
+            {
+                try
+                {
+                    await sendContentTask.ConfigureAwait(false);
+                }
+                catch
+                {
+                    // Exceptions will be bubbled up from sendContentTask here,
+                    // which means the result of readResponseTask won't be observed directly:
+                    // Do a background await to log any exceptions.
+                    _connection.LogExceptions(readResponseTask);
+                    throw;
+                }
             }
             else
             {
-                // Return large amount of pooled bytes. Start smaller for recv buffer.
-                _buffer.Dispose();
-                _buffer = new ArrayBuffer(64, usePool: true);
+                // Duplex is being used, so we can't wait for content to finish sending.
+                // Do a background await to log any exceptions.
+                _connection.LogExceptions(sendContentTask);
             }
 
-            // Send content in parallel with reading response.
-            Task sendContentTask = request.Content != null ? SendContentAsync(request.Content, firstFrameLengthRemaining, cancellationToken) : Task.CompletedTask;
+            // Wait for the response headers to be read.
+            await readResponseTask.ConfigureAwait(false);
 
+            // Set our content stream.
+            var responseContent = (HttpConnectionResponseContent)_response.Content;
+            if (responseContent.Headers.ContentLength == 0)
+            {
+                // For 0-length content, drain the response frames to read any trailing headers.
+                await DrainContentLength0Frames(cancellationToken).ConfigureAwait(false);
+                responseContent.SetStream(EmptyReadStream.Instance);
+            }
+            else
+            {
+                // For responses that may have content, a read stream is required to finish up the request.
+                responseContent.SetStream(new Http3ReadStream(this));
+            }
 
-            // Read response in parallel with sending content.
+            // Process any Set-Cookie headers.
+            if (_connection.Pool.Settings._useCookies)
+            {
+                CookieHelper.ProcessReceivedCookies(_response, _connection.Pool.Settings._cookieContainer);
+            }
+
+            // To avoid a circular reference, null out the stream's response.
+            HttpResponseMessage response = _response;
+            _response = null;
+            return response;
         }
 
+        /// <summary>
+        /// Waits for the initial response headers to be completed, including e.g. Expect 100 Continue.
+        /// </summary>
+        /// <param name="cancellationToken"></param>
+        /// <returns></returns>
         private async Task ReadResponseAsync(CancellationToken cancellationToken)
         {
-            // Buffer should be empty right now.
-            Debug.Assert(_buffer.ActiveLength == 0);
-
-            // Loop while reading frames.
-            while (true)
+            do
             {
+                _headerState = State.StatusHeader;
+
                 (Http3FrameType? frameType, long payloadLength) = await ReadFrameEnvelopeAsync(cancellationToken).ConfigureAwait(false);
 
-                switch (frameType)
+                if (frameType != Http3FrameType.Headers)
                 {
-                    case Http3FrameType.Headers:
-                        await ReadHeadersAsync(payloadLength, cancellationToken).ConfigureAwait(false);
-                        break;
-                    case Http3FrameType.Data:
-                        await ReadDataAsync(payloadLength, cancellationToken).ConfigureAwait(false);
-                        break;
-                    case Http3FrameType.Settings:
-                    case Http3FrameType.GoAway:
-                    case Http3FrameType.MaxPushId:
-                    case Http3FrameType.DuplicatePush:
-                    case Http3FrameType.PushPromise:
-                    case Http3FrameType.CancelPush:
-                        // TODO: close connection with H3_FRAME_UNEXPECTED.
-                        throw new HttpRequestException($"Server sent inappropriate frame type {frameType}.");
-                    case null:
-                        // TODO: end of stream reached. check if we're shutting down, or if this is an error.
-                        break;
-                    default:
-                        await SkipUnknownPayloadAsync(frameType.GetValueOrDefault(), payloadLength, cancellationToken).ConfigureAwait(false);
-                        break;
+                    throw new HttpRequestException($"Expected HEADERS frame, got {frameType}.");
                 }
+
+                await ReadHeadersAsync(payloadLength, cancellationToken).ConfigureAwait(false);
             }
+            while ((int)_response.StatusCode < 200);
+
+            _headerState = State.TrailingHeaders;
         }
 
         private async Task SendContentAsync(HttpContent content, long firstFrameLengthRemaining, CancellationToken cancellationToken)
         {
+            // If we're using Expect 100 Continue, wait to send content
+            // until we get a response back or until our timeout elapses.
             if (_expect100ContinueCompletionSource != null)
             {
-                await _expect100ContinueCompletionSource.Task.ConfigureAwait(false);
+                Timer timer = null;
+
+                try
+                {
+                    if (_connection.Pool.Settings._expect100ContinueTimeout != Timeout.InfiniteTimeSpan)
+                    {
+                        timer = new Timer(o =>
+                        {
+                            ((Http3Stream)o)._expect100ContinueCompletionSource.TrySetResult(true);
+                        }, this, _connection.Pool.Settings._expect100ContinueTimeout, Timeout.InfiniteTimeSpan);
+                    }
+
+                    if (!await _expect100ContinueCompletionSource.Task.ConfigureAwait(false))
+                    {
+                        // We received an error response code, so the body should not be sent.
+                        return;
+                    }
+                }
+                finally
+                {
+                    if (timer != null)
+                    {
+                        await timer.DisposeAsync().ConfigureAwait(false);
+                    }
+                }
             }
 
-            using (var writeStream = new Http3WriteStream(_stream, firstFrameLengthRemaining))
+            using (var writeStream = new Http3WriteStream(_stream, content.Headers.ContentLength, firstFrameLengthRemaining))
             {
                 await content.CopyToAsync(writeStream, null, cancellationToken).ConfigureAwait(false);
             }
-            await _stream.FlushAsync(cancellationToken).ConfigureAwait(false);
+            _stream.ShutdownWrite();
+        }
+
+        private async ValueTask DrainContentLength0Frames(CancellationToken cancellationToken)
+        {
+            Http3FrameType? frameType;
+            long payloadLength;
+
+            while (true)
+            {
+                (frameType, payloadLength) = await ReadFrameEnvelopeAsync(cancellationToken).ConfigureAwait(false);
+
+                switch (frameType)
+                {
+                    case null:
+                        // Done receiving, shutdown stream, dispose of buffer, and copy over trailing headers.
+                        _stream.ShutdownRead();
+                        _buffer.Dispose();
+
+                        CopyTrailersToResponseMessage(_response);
+                        return;
+                    case Http3FrameType.Headers:
+                        // Pick up any trailing headers.
+                        await ReadHeadersAsync(payloadLength, cancellationToken).ConfigureAwait(false);
+
+
+                        // Stop looping after a trailing header.
+                        // There may be extra frames after this one, but they would all be unknown extension
+                        // frames that can be safely ignored. Just stop reading here.
+                        goto case null;
+                    case Http3FrameType.Data:
+                        // The sum of data frames must equal content length. Because this method is only
+                        // called for a Content-Length of 0, anything other than 0 here would be an error.
+                        // Per spec, 0-length payload is allowed.
+                        if (payloadLength != 0)
+                        {
+                            throw new HttpRequestException($"Content larger than content-length.");
+                        }
+                        break;
+                    default:
+                        Debug.Fail($"Recieved unexpected frame type {frameType}.");
+                        return;
+                }
+            }
+        }
+
+        private void CopyTrailersToResponseMessage(HttpResponseMessage responseMessage)
+        {
+            if (_trailingHeaders?.Count > 0)
+            {
+                foreach ((HeaderDescriptor name, string value) in _trailingHeaders)
+                {
+                    responseMessage.TrailingHeaders.TryAddWithoutValidation(name, value);
+                }
+                _trailingHeaders.Clear();
+            }
         }
 
         private void BufferHeaders(HttpRequestMessage request)
@@ -202,6 +351,9 @@ namespace System.Net.Http
 
             if (request.Content == null)
             {
+                // Expect 100 Continue requires content.
+                request.Headers.ExpectContinue = null;
+
                 if (normalizedMethod.MustHaveRequestBody)
                 {
                     BufferIndexedHeader(H3StaticTable.ContentLength0);
@@ -349,30 +501,55 @@ namespace System.Net.Http
             long frameType, payloadLength;
             int bytesRead;
 
-            while (!Http3Frame.TryReadIntegerPair(_buffer.ActiveSpan, out frameType, out payloadLength, out bytesRead))
+            while (true)
             {
-                _buffer.EnsureAvailableSpace(2);
-                bytesRead = await _stream.ReadAsync(_buffer.AvailableMemory, cancellationToken).ConfigureAwait(false);
+                while (!Http3Frame.TryReadIntegerPair(_buffer.ActiveSpan, out frameType, out payloadLength, out bytesRead))
+                {
+                    _buffer.EnsureAvailableSpace(2);
+                    bytesRead = await _stream.ReadAsync(_buffer.AvailableMemory, cancellationToken).ConfigureAwait(false);
 
-                if (bytesRead != 0)
-                {
-                    _buffer.Commit(bytesRead);
+                    if (bytesRead != 0)
+                    {
+                        _buffer.Commit(bytesRead);
+                    }
+                    else if (_buffer.ActiveLength == 0)
+                    {
+                        // End of stream.
+                        return (null, 0);
+                    }
+                    else
+                    {
+                        // Our buffer has partial frame data in it but not enough to complete the read: bail out.
+                        throw new HttpRequestException("Partial frame envelope received; unexpected end of stream.");
+                    }
                 }
-                else if (_buffer.ActiveLength == 0)
+
+                _buffer.Discard(bytesRead);
+
+                switch ((Http3FrameType)frameType)
                 {
-                    // End of stream.
-                    return (null, 0);
-                }
-                else
-                {
-                    // Our buffer has partial frame data in it but not enough to complete the read: bail out.
-                    throw new HttpRequestException("Partial frame envelope received; unexpected end of stream.");
+                    case Http3FrameType.Headers:
+                    case Http3FrameType.Data:
+                        return ((Http3FrameType)frameType, payloadLength);
+                    case Http3FrameType.Settings:
+                    case Http3FrameType.GoAway:
+                    case Http3FrameType.MaxPushId:
+                        // These frames should only be received on a control stream, not a response stream.
+                        // TODO: close the connection with H3_FRAME_UNEXPECTED.
+                        throw new HttpRequestException($"Server sent inappropriate frame type {frameType}.");
+                    case Http3FrameType.DuplicatePush:
+                    case Http3FrameType.PushPromise:
+                    case Http3FrameType.CancelPush:
+                        // Because we haven't sent any MAX_PUSH_ID frames, any of these push-related
+                        // frames that the server sends will have an out-of-range push ID.
+                        // TODO: close the conenction with H3_ID_ERROR.
+                        throw new HttpRequestException($"Server sent inappropriate frame type {frameType}.");
+                    default:
+                        // Unknown frame types should be skipped.
+                        await SkipUnknownPayloadAsync((Http3FrameType)frameType, payloadLength, cancellationToken).ConfigureAwait(false);
+                        break;
                 }
             }
-
-            _buffer.Discard(bytesRead);
-
-            return ((Http3FrameType)frameType, payloadLength);
         }
 
         private async ValueTask ReadHeadersAsync(long headersLength, CancellationToken cancellationToken)
@@ -402,18 +579,94 @@ namespace System.Net.Http
             }
         }
 
+        private static ReadOnlySpan<byte> StatusHeaderNameBytes => new byte[] { (byte)'s', (byte)'t', (byte)'a', (byte)'t', (byte)'u', (byte)'s' };
+
         void IHttpHeadersHandler.OnHeader(ReadOnlySpan<byte> name, ReadOnlySpan<byte> value)
         {
+            Debug.Assert(name.Length > 0);
 
+            if (name[0] == ':')
+            {
+                if (!name.Slice(1).SequenceEqual(StatusHeaderNameBytes))
+                {
+                    throw new HttpRequestException(SR.net_http_invalid_response);
+                }
+
+                if (_headerState != State.StatusHeader)
+                {
+                    if (NetEventSource.IsEnabled) Trace("Received extra status header.");
+                    throw new HttpRequestException(SR.Format(SR.net_http_invalid_response_status_code, "duplicate status"));
+                }
+
+                int statusCode = HttpConnectionBase.ParseStatusCode(value);
+
+                _response = new HttpResponseMessage()
+                {
+                    Version = HttpVersion.Version30,
+                    RequestMessage = _request,
+                    Content = new HttpConnectionResponseContent(),
+                    StatusCode = (HttpStatusCode)statusCode
+                };
+
+                if (statusCode < 200)
+                {
+                    // Expect 100 continue response.
+                    _headerState = State.SkipExpect100Headers;
+
+                    if (_response.StatusCode == HttpStatusCode.Continue && _expect100ContinueCompletionSource != null)
+                    {
+                        _expect100ContinueCompletionSource.TrySetResult(true);
+                    }
+                }
+                else
+                {
+                    _headerState = State.ResponseHeaders;
+                    if (_expect100ContinueCompletionSource != null)
+                    {
+                        // If the final status code is >= 300, skip sending the body.
+                        bool shouldSendBody = (statusCode < 300);
+
+                        if (NetEventSource.IsEnabled) Trace($"Expecting 100 Continue but received final status {statusCode}.");
+                        _expect100ContinueCompletionSource.TrySetResult(shouldSendBody);
+                    }
+                }
+            }
+            else if (_headerState == State.SkipExpect100Headers)
+            {
+                // Ignore any headers that came as part of a 100 Continue response.
+                return;
+            }
+            else
+            {
+                if (!HeaderDescriptor.TryGet(name, out HeaderDescriptor descriptor))
+                {
+                    // Invalid header name
+                    throw new HttpRequestException(SR.Format(SR.net_http_invalid_response_header_name, Encoding.ASCII.GetString(name)));
+                }
+
+                string headerValue = descriptor.GetHeaderValue(value);
+
+                switch (_headerState)
+                {
+                    case State.ResponseHeaders when descriptor.HeaderType.HasFlag(HttpHeaderType.Content):
+                        _response.Content.Headers.TryAddWithoutValidation(descriptor, headerValue);
+                        break;
+                    case State.ResponseHeaders:
+                        _response.Headers.TryAddWithoutValidation(descriptor.HeaderType.HasFlag(HttpHeaderType.Request) ? descriptor.AsCustomHeader() : descriptor, headerValue);
+                        break;
+                    case State.TrailingHeaders:
+                        _response.TrailingHeaders.TryAddWithoutValidation(descriptor.HeaderType.HasFlag(HttpHeaderType.Request) ? descriptor.AsCustomHeader() : descriptor, headerValue);
+                        break;
+                    default:
+                        Debug.Fail($"Unexpected {nameof(Http3Stream)}.{nameof(_headerState)} '{_headerState}'.");
+                        break;
+                }
+            }
         }
 
         void IHttpHeadersHandler.OnHeadersComplete(bool endStream)
         {
             throw new NotImplementedException();
-        }
-
-        private async ValueTask ReadDataAsync(long dataLength, CancellationToken cancellationToken)
-        {
         }
 
         private async ValueTask SkipUnknownPayloadAsync(Http3FrameType frameType, long payloadLength, CancellationToken cancellationToken)
@@ -447,9 +700,176 @@ namespace System.Net.Http
             }
         }
 
+        public void Trace(string message, [CallerMemberName] string memberName = null) =>
+            _connection.Trace(_stream.StreamId, message, memberName);
+
+        private sealed class Http3ReadStream : HttpBaseStream
+        {
+            private Http3Stream _stream;
+            private HttpResponseMessage _response;
+
+            public override bool CanRead => true;
+
+            public override bool CanWrite => false;
+
+            public Http3ReadStream(Http3Stream stream)
+            {
+                _stream = stream;
+            }
+
+            protected override void Dispose(bool disposing)
+            {
+                if (_stream != null)
+                {
+                    _stream.Dispose();
+                    _stream = null;
+                    _response = null;
+                }
+            }
+
+            public override async ValueTask DisposeAsync()
+            {
+                if (_stream != null)
+                {
+                    await _stream.DisposeAsync().ConfigureAwait(false);
+                    _stream = null;
+                    _response = null;
+                }
+            }
+
+            // This uses sync over async but if QUIC implementation will just do that anyway, doing it here may not matter.
+            public override int Read(Span<byte> buffer)
+            {
+                if (_stream == null)
+                {
+                    throw new ObjectDisposedException(nameof(Http3Stream));
+                }
+
+                if (_response == null)
+                {
+                    // Response is nulled out on EOS.
+                    return 0;
+                }
+
+                Http3FrameType? frameType;
+                long payloadLength;
+                int totalRead = 0;
+
+                while (!buffer.IsEmpty)
+                {
+                    (frameType, payloadLength) = _stream.ReadFrameEnvelopeAsync(CancellationToken.None).GetAwaiter().GetResult();
+
+                    switch (frameType)
+                    {
+                        case Http3FrameType.Data:
+                            // There was probably some data read into our recv buffer, so copy that out first.
+                            int copyLength = Math.Min(_stream._buffer.ActiveLength, buffer.Length);
+                            _stream._buffer.ActiveSpan.Slice(copyLength).CopyTo(buffer);
+                            _stream._buffer.Discard(copyLength);
+                            buffer = buffer.Slice(copyLength);
+                            payloadLength -= copyLength;
+                            totalRead += copyLength;
+
+                            // Read out any remaining part of the payload directly into the buffer.
+                            while (!buffer.IsEmpty && payloadLength != 0)
+                            {
+                                copyLength = _stream._stream.Read(buffer);
+                                buffer = buffer.Slice(copyLength);
+                                payloadLength -= copyLength;
+                                totalRead += copyLength;
+                            }
+                            break;
+                        case Http3FrameType.Headers:
+                            // Read any trailing headers.
+                            _stream.ReadHeadersAsync(payloadLength, CancellationToken.None).GetAwaiter().GetResult();
+
+                            // There may be more frames after this one, but they would all be unknown extension
+                            // frames that we are allowed to skip. Just close the stream early.
+                            goto case null;
+                        case null:
+                            // End of stream.
+                            _stream._stream.ShutdownRead();
+                            _stream._buffer.Dispose();
+                            _stream.CopyTrailersToResponseMessage(_response);
+                            break;
+                    }
+
+                }
+
+                return totalRead;
+            }
+
+            public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken)
+            {
+                if (_stream == null)
+                {
+                    throw new ObjectDisposedException(nameof(Http3Stream));
+                }
+
+                if (_response == null)
+                {
+                    // Response is nulled out on EOS.
+                    return 0;
+                }
+
+                Http3FrameType? frameType;
+                long payloadLength;
+                int totalRead = 0;
+
+                while (!buffer.IsEmpty)
+                {
+                    (frameType, payloadLength) = await _stream.ReadFrameEnvelopeAsync(cancellationToken).ConfigureAwait(false);
+
+                    switch (frameType)
+                    {
+                        case Http3FrameType.Data:
+                            // There was probably some data read into our recv buffer, so copy that out first.
+                            int copyLength = Math.Min(_stream._buffer.ActiveLength, buffer.Length);
+                            _stream._buffer.ActiveSpan.Slice(copyLength).CopyTo(buffer.Span);
+                            _stream._buffer.Discard(copyLength);
+                            buffer = buffer.Slice(copyLength);
+                            payloadLength -= copyLength;
+                            totalRead += copyLength;
+
+                            // Read out any remaining part of the payload directly into the buffer.
+                            while (!buffer.IsEmpty && payloadLength != 0)
+                            {
+                                copyLength = await _stream._stream.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
+                                buffer = buffer.Slice(copyLength);
+                                payloadLength -= copyLength;
+                                totalRead += copyLength;
+                            }
+                            break;
+                        case Http3FrameType.Headers:
+                            // Read any trailing headers.
+                            await _stream.ReadHeadersAsync(payloadLength, cancellationToken).ConfigureAwait(false);
+
+                            // There may be more frames after this one, but they would all be unknown extension
+                            // frames that we are allowed to skip. Just close the stream early.
+                            goto case null;
+                        case null:
+                            // End of stream.
+                            _stream._stream.ShutdownRead();
+                            _stream._buffer.Dispose();
+                            _stream.CopyTrailersToResponseMessage(_response);
+                            break;
+                    }
+
+                }
+
+                return totalRead;
+            }
+
+            public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken)
+            {
+                throw new NotImplementedException();
+            }
+        }
+
         private sealed class Http3WriteStream : HttpBaseStream
         {
             private QuicStream _stream;
+            private long? _contentLengthRemaining;
             private long _firstFrameLengthRemaining;
             private byte[] _dataFrame;
 
@@ -459,10 +879,11 @@ namespace System.Net.Http
 
             public long FirstFrameLengthRemaining => _firstFrameLengthRemaining;
 
-            public Http3WriteStream(QuicStream stream, long firstFrameLengthRemaining)
+            public Http3WriteStream(QuicStream stream, long? contentLength, long firstFrameLengthRemaining)
             {
                 _stream = stream;
                 _firstFrameLengthRemaining = firstFrameLengthRemaining;
+                _contentLengthRemaining = contentLength;
             }
 
             protected override void Dispose(bool disposing)
@@ -494,6 +915,13 @@ namespace System.Net.Http
                 {
                     return;
                 }
+
+                if (buffer.Length > _contentLengthRemaining)
+                {
+                    string msg = "Unable to write content larger than what was specified in Content-Length header.";
+                    throw new IOException(msg, new HttpRequestException(msg));
+                }
+                _contentLengthRemaining -= buffer.Length;
 
                 long remaining = _firstFrameLengthRemaining;
                 if (remaining > 0)
@@ -535,6 +963,14 @@ namespace System.Net.Http
             {
                 return _stream.FlushAsync(cancellationToken);
             }
+        }
+
+        private enum State
+        {
+            StatusHeader,
+            SkipExpect100Headers,
+            ResponseHeaders,
+            TrailingHeaders
         }
     }
 }

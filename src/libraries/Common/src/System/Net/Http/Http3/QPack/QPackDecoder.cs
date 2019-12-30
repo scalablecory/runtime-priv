@@ -6,10 +6,9 @@ using System.Buffers;
 using System.Net.Http.HPack;
 
 #if KESTREL
-using Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http;
 namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3.QPack
 #else
-namespace System.Net.Http
+namespace System.Net.Http.QPack
 #endif
 {
     internal class QPackDecoder

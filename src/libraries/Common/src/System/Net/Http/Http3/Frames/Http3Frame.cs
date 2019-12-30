@@ -4,7 +4,11 @@
 using System;
 using System.Diagnostics;
 
+#if KESTREL
 namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3
+#else
+namespace System.Net.Http
+#endif
 {
     internal static partial class Http3Frame
     {

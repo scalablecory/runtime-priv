@@ -3,7 +3,11 @@
 
 using System;
 
+#if KESTREL
 namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3.QPack
+#else
+namespace System.Net.Http.QPack
+#endif
 {
     internal sealed class QPackEncodingException : Exception
     {

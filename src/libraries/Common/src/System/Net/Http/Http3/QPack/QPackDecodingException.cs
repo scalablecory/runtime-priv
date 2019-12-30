@@ -5,10 +5,9 @@ using System;
 using System.Runtime.Serialization;
 
 #if KESTREL
-using Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http;
 namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3.QPack
 #else
-namespace System.Net.Http
+namespace System.Net.Http.QPack
 #endif
 {
     [Serializable]

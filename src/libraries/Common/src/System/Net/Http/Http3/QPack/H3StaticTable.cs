@@ -6,10 +6,9 @@ using System.Net.Http;
 using System.Text;
 
 #if KESTREL
-using Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http;
 namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3.QPack
 #else
-namespace System.Net.Http
+namespace System.Net.Http.QPack
 #endif
 {
     internal class H3StaticTable
